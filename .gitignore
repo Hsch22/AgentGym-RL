@@ -1,0 +1,8 @@
+# Runtime outputs & model weights
+outputs/
+saves/
+models/
+
+# Eval modules (not part of core)
+AgentEval/
+AgentItemId/

@@ -14,6 +14,7 @@ from agentenv.envs import (
     TodoEnvClient,
     WeatherEnvClient,
     WebarenaEnvClient,
+    WebServLiteEnvClient,
     WebshopEnvClient,
     WordleEnvClient,
     SearchQAEnvClient,
@@ -37,6 +38,7 @@ def init_env_client(args):
         "sheet": SheetEnvClient,
         "academia": AcademiaEnvClient,
         "searchqa": SearchQAEnvClient,
+        "webservlite": WebServLiteEnvClient,
     }
     # select task according to the name
     envclient_class = envclient_classes.get(args.task_name.lower(), None)

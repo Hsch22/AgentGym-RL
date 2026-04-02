@@ -15,6 +15,7 @@
 A unified tracking interface that supports logging data to different backend
 """
 import dataclasses
+import os
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -38,7 +39,22 @@ class Tracking(object):
 
         if 'tracking' in default_backend or 'wandb' in default_backend:
             import wandb
-            wandb.init(project=project_name, name=experiment_name, config=config)
+            wandb_init_kwargs = {
+                'project': project_name,
+                'name': experiment_name,
+                'config': config,
+            }
+            wandb_mode = os.environ.get('WANDB_MODE')
+            if wandb_mode:
+                wandb_init_kwargs['mode'] = wandb_mode
+            wandb_dir = os.environ.get('WANDB_DIR')
+            if wandb_dir:
+                wandb_init_kwargs['dir'] = wandb_dir
+            run_id = os.environ.get('WANDB_RUN_ID')
+            if run_id:
+                wandb_init_kwargs['id'] = run_id
+                wandb_init_kwargs['resume'] = os.environ.get('WANDB_RESUME', 'allow')
+            wandb.init(**wandb_init_kwargs)
             self.logger['wandb'] = wandb
 
         if 'mlflow' in default_backend:

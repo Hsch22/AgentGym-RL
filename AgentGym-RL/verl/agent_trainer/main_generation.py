@@ -46,6 +46,9 @@ def main(config):
     from omegaconf import OmegaConf
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
+    ray.init(num_gpus=config.trainer.n_gpus_per_node * config.trainer.nnodes,
+             num_cpus=8 * config.trainer.nnodes,
+             ignore_reinit_error=True)
     local_path = copy_local_path_from_hdfs(config.model.path)
     from verl.utils import hf_tokenizer
     tokenizer = hf_tokenizer(local_path)
@@ -76,77 +79,90 @@ def main(config):
     wg = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=ray_cls_with_init)
     wg.init_model()
 
-    total_samples = len(dataset)
-    # real_batch_size = data.batch['input_ids'].shape[0]
-    config_batch_size = config.data.batch_size
-    dp_size = wg.world_size // config.rollout.tensor_model_parallel_size
-    num_batch = (total_samples // config_batch_size) + 1
-    output_lst = [[] for _ in range(config.data.n_samples)]
-    env_client = init_env_client(config.agentgym)
+    env_client = None
+    try:
+        total_samples = len(dataset)
+        # real_batch_size = data.batch['input_ids'].shape[0]
+        config_batch_size = config.data.batch_size
+        dp_size = wg.world_size // config.rollout.tensor_model_parallel_size
+        num_batch = (total_samples // config_batch_size) + 1
+        output_lst = [[] for _ in range(config.data.n_samples)]
+        env_client = init_env_client(config.agentgym)
 
-    for batch_idx in range(num_batch):
-        print(f'[{batch_idx+1}/{num_batch}] Start to process.')
-        start_idx = batch_idx * config_batch_size
-        end_idx = min(total_samples, start_idx + config_batch_size)
-        batch_item_ids = item_ids[start_idx: end_idx]
-        prompt_with_chat_template = ["<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + env_client.conversation_start[0]["value"] + "<|im_end|>\n<|im_start|>assistant\n" + env_client.conversation_start[1]["value"] + "<|im_end|>" for _ in range(len(batch_item_ids))]
-        messages = [[{"role": "user", "content": env_client.conversation_start[0]["value"]},
-                     {"role": "assistant", "content": env_client.conversation_start[1]["value"]}] for _ in range(len(batch_item_ids))]
-
-        input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
-                                                                         tokenizer=tokenizer,
-                                                                         max_length=config.data.max_prompt_length,
-                                                                         pad_token_id=tokenizer.pad_token_id,
-                                                                         left_pad=True)
-        position_ids = compute_position_id_with_mask(attention_mask)
-
-        batch_dict = {'input_ids': input_ids, 'attention_mask': attention_mask, 'position_ids': position_ids}
-
-        data = DataProto.from_dict(batch_dict)
-        data.meta_info['global_steps'] = 'test_batch_' + str(batch_idx)
-        data.meta_info['max_rounds'] = config.agentgym.max_rounds
-        data.non_tensor_batch["item_id"] = np.array(batch_item_ids, dtype=object)
-        data.non_tensor_batch["raw_prompt"] = np.array(messages, dtype=object)
-        real_batch_size = data.batch['input_ids'].shape[0]
-        if real_batch_size % dp_size != 0:
-            dummy_data_size = dp_size - real_batch_size % dp_size
-            dummy_data = data[:dummy_data_size]
-            data = DataProto.concat([data, dummy_data])
-            print(
-                f'dp_size {dp_size} is not divisible by real_batch_size {real_batch_size}, add {dummy_data_size} dummy data'
+        for batch_idx in range(num_batch):
+            print(f'[{batch_idx+1}/{num_batch}] Start to process.')
+            start_idx = batch_idx * config_batch_size
+            end_idx = min(total_samples, start_idx + config_batch_size)
+            batch_item_ids = item_ids[start_idx: end_idx]
+            single_messages = [{"role": "user", "content": env_client.conversation_start[0]["value"]},
+                               {"role": "assistant", "content": env_client.conversation_start[1]["value"]}]
+            single_prompt = tokenizer.apply_chat_template(
+                single_messages, tokenize=False, add_generation_prompt=False,
             )
+            prompt_with_chat_template = [single_prompt for _ in range(len(batch_item_ids))]
+            messages = [list(single_messages) for _ in range(len(batch_item_ids))]
 
-        batch_size = data.batch['input_ids'].shape[0]
-        assert batch_size % dp_size == 0, f'batch_size {batch_size} is not divisible by dp_size {dp_size}'
+            input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
+                                                                             tokenizer=tokenizer,
+                                                                             max_length=config.data.max_prompt_length,
+                                                                             pad_token_id=tokenizer.pad_token_id,
+                                                                             left_pad=True)
+            position_ids = compute_position_id_with_mask(attention_mask)
 
-        print(f'[{batch_idx+1}/{num_batch}] Start to generate.')
+            batch_dict = {'input_ids': input_ids, 'attention_mask': attention_mask, 'position_ids': position_ids}
 
-        for i in range(config.data.n_samples):
-            output = wg.generate_sequences(data)
-            # remove dummy data
-            output = output[:real_batch_size]
+            data = DataProto.from_dict(batch_dict)
+            data.meta_info['global_steps'] = 'test_batch_' + str(batch_idx)
+            data.meta_info['max_rounds'] = config.agentgym.max_rounds
+            data.non_tensor_batch["item_id"] = np.array(batch_item_ids, dtype=object)
+            data.non_tensor_batch["raw_prompt"] = np.array(messages, dtype=object)
+            real_batch_size = data.batch['input_ids'].shape[0]
+            if real_batch_size % dp_size != 0:
+                dummy_data_size = dp_size - real_batch_size % dp_size
+                dummy_data = data[:dummy_data_size]
+                data = DataProto.concat([data, dummy_data])
+                print(
+                    f'dp_size {dp_size} is not divisible by real_batch_size {real_batch_size}, add {dummy_data_size} dummy data'
+                )
 
-            output_lst[i].extend(output.batch['task_scores'].sum(dim=-1).tolist())
+            batch_size = data.batch['input_ids'].shape[0]
+            assert batch_size % dp_size == 0, f'batch_size {batch_size} is not divisible by dp_size {dp_size}'
 
-    # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
-    output_np = np.array(output_lst, dtype=object)
-    output_np = np.transpose(output_np, axes=(1, 0))
-    output_lst = output_np.tolist()
+            print(f'[{batch_idx+1}/{num_batch}] Start to generate.')
 
-    print("============Total Task Evaluation============")
-    print(f"Avg@{config.data.n_samples}: {np.mean(output_np)}")
-    print(f"Pass@{config.data.n_samples}: {np.mean(np.max(output_np, axis=-1) > 0)}")
-    print("============Sub Task Evaluation============")
-    
-    category_success_bucket = defaultdict(list)
-    for item_id, score in zip(item_ids, output_lst):
-        category = category_map[item_id]
-        category_success_bucket[category].append(score)
-    for category_file in category_files:
-        category = category_file.split(".")[0]
-        print(f"Category: {category}")
-        print(f"Avg@{config.data.n_samples}: {np.mean(np.array(category_success_bucket[category]))}")
-        print(f"Pass@{config.data.n_samples}: {np.mean(np.max(np.array(category_success_bucket[category]), axis=-1) > 0)}")
+            for i in range(config.data.n_samples):
+                output = wg.generate_sequences(data)
+                # remove dummy data
+                output = output[:real_batch_size]
+
+                output_lst[i].extend(output.batch['task_scores'].sum(dim=-1).tolist())
+
+        # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
+        output_np = np.array(output_lst, dtype=object)
+        output_np = np.transpose(output_np, axes=(1, 0))
+        output_lst = output_np.tolist()
+
+        print("============Total Task Evaluation============")
+        print(f"Avg@{config.data.n_samples}: {np.mean(output_np)}")
+        print(f"Pass@{config.data.n_samples}: {np.mean(np.max(output_np, axis=-1) > 0)}")
+        print("============Sub Task Evaluation============")
+        
+        category_success_bucket = defaultdict(list)
+        for item_id, score in zip(item_ids, output_lst):
+            category = category_map[item_id]
+            category_success_bucket[category].append(score)
+        for category_file in category_files:
+            category = category_file.split(".")[0]
+            print(f"Category: {category}")
+            print(f"Avg@{config.data.n_samples}: {np.mean(np.array(category_success_bucket[category]))}")
+            print(f"Pass@{config.data.n_samples}: {np.mean(np.max(np.array(category_success_bucket[category]), axis=-1) > 0)}")
+    finally:
+        if env_client is not None:
+            try:
+                env_client.close()
+            except Exception as e:
+                print(f"Error during closing eval env client: {e}")
+        ray.shutdown()
 
 
 

@@ -14,6 +14,8 @@
 """
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
+import os
+
 from verl.agent_trainer.ppo.ray_trainer import RayPPOTrainer
 
 import ray
@@ -28,7 +30,24 @@ def main(config):
 def run_ppo(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        env_vars = {
+            'TOKENIZERS_PARALLELISM': 'true',
+            'NCCL_DEBUG': 'WARN',
+        }
+        for key in (
+                'WANDB_API_KEY',
+                'WANDB_MODE',
+                'WANDB_RUN_ID',
+                'WANDB_RESUME',
+                'WANDB_BASE_URL',
+                'WANDB_DIR',
+                'WANDB_CONFIG_DIR',
+                'WANDB_CACHE_DIR',
+        ):
+            value = os.environ.get(key)
+            if value:
+                env_vars[key] = value
+        ray.init(runtime_env={'env_vars': env_vars})
 
     ray.get(main_task.remote(config))
 

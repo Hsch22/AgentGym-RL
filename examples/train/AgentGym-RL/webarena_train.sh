@@ -6,15 +6,17 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 task_name="webarena"
 
 cd AgentGym-RL
-source activate
-conda activate agentgym-rl
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate agentgym-rl-clean
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export WANDB_BASE_URL=https://api.bandw.top
 
 env_server_url="http://127.0.0.1:36005"
 
 # start training
-wandb login xxx
+if [ -n "${WANDB_API_KEY:-}" ]; then
+    wandb login "${WANDB_API_KEY}"
+fi
 
 pure_agent_model_name="Qwen2.5-7B-Instruct"
 agent_model_path="models/${pure_agent_model_name}"
@@ -36,7 +38,10 @@ model_save_path=${model_save_dir}/${exp_name}
 
 mkdir -p ${model_save_path}
 
-HYDRA_FULL_ERROR=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True WANDB_MODE=online python3 -m verl.agent_trainer.main_ppo  \
+wandb_mode="${WANDB_MODE:-offline}"
+project_name="${WANDB_PROJECT:-agentgym_rl}"
+
+HYDRA_FULL_ERROR=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True WANDB_MODE=${wandb_mode} python3 -m verl.agent_trainer.main_ppo  \
     algorithm.adv_estimator=grpo \
     algorithm.rounds_ctrl.type=fixed \
     algorithm.rounds_ctrl.rounds=15 \
@@ -63,7 +68,7 @@ HYDRA_FULL_ERROR=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True WANDB_MODE=o
     actor_rollout_ref.rollout.rollout_log_dir=${model_save_path}/executer_logs \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     trainer.default_local_dir=${model_save_path} \
-    trainer.project_name=xxx \
+    trainer.project_name=${project_name} \
     trainer.experiment_name=${exp_name} \
     trainer.save_freq=25 \
     trainer.total_epochs=${total_epoches}

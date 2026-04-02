@@ -353,6 +353,7 @@ __MODEL_DTENSOR_WEIGHT_LOADER_REGISTRY__ = {
     "GPTBigCodeForCausalLM": gptbigcode_dtensor_load_weights,
     "Starcoder2ForCausalLM": starcoder2_dtensor_load_weights,
     "Qwen2ForCausalLM": qwen2_dtensor_weight_loader,
+    "Qwen3ForCausalLM": qwen2_dtensor_weight_loader,
     "DeepseekV2ForCausalLM": deepseekv2_dtensor_weight_loader,
     "Qwen2VLForConditionalGeneration": qwen2vl_dtensor_weight_loader,
 }

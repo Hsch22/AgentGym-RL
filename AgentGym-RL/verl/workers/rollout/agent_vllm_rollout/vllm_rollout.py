@@ -98,6 +98,7 @@ class vLLMRollout(BaseRollout):
             dtype=rollout_config.dtype,
             enforce_eager=rollout_config.enforce_eager,
             gpu_memory_utilization=rollout_config.gpu_memory_utilization,
+            max_model_len=rollout_config.max_model_len,
             skip_tokenizer_init=False,
             load_format=rollout_config.load_format,
             disable_log_stats=rollout_config.disable_log_stats,
@@ -210,143 +211,149 @@ class vLLMRollout(BaseRollout):
         batch_size = prompts.batch['input_ids'].size(0)
         batch_size *= self.config.n
         rollout_handler_ls = self.preprocess_prompt_to_rollout_handler(prompts, n=self.config.n)
-        env_clients = [init_env_client(self.agentgym_config) for _ in range(batch_size)]
-        time.sleep(self.config.send_interval) # take a break before sendng request
-        all_done_flag = False
-        for idx, rollout_handler in enumerate(rollout_handler_ls):
-            try:
-                env_clients[idx].reset(rollout_handler.item_id)
-                task = env_clients[idx].observe()
-                rollout_handler.add_user_message(self.tokenizer, task)
-            except TimeoutError:
-                print(f"Reset Timeout: Webarena Env Timeout. item id = {rollout_handler.item_id}")
-                rollout_handler.done = True
-                rollout_handler.score = 0
-
-        rounds = 0
-        task_rounds = [0] * batch_size
-        rollout_bar = tqdm(total = max_rounds, desc="Running rounds", disable=torch.distributed.get_rank() != 0)
-        def agent_step(i, idx):
-            content = self.tokenizer.decode(response_ids[i], skip_special_tokens=True)
-            rollout_handler_ls[idx].add_assistant_message(self.tokenizer, content)
-            task_rounds[idx] += 1
-            try:
-                step_output = env_clients[idx].step(content)
-                state, rollout_handler_ls[idx].score, rollout_handler_ls[idx].done = (
-                    step_output.state,
-                    step_output.reward,
-                    step_output.done,
-                )
-                rollout_handler_ls[idx].add_user_message(self.tokenizer, state)
-                return step_output.done
-            except Exception as e:
-                rollout_handler_ls[idx].score = 0
-                rollout_handler_ls[idx].done = True
-                print(f"Rollou step Error: {e} item id = {rollout_handler_ls[idx].item_id}")
-                return True
-        while rounds < max_rounds and not all_done_flag:
-            # get generation prompt
-            generation_prompt_idxs = []
-            not_done_idxs = []
-            for idx, rollout_handler in enumerate(rollout_handler_ls):
-                if not rollout_handler.done:
-                    generation_prompt_idxs.append(rollout_handler.get_generation_prompt(self.tokenizer))
-                    not_done_idxs.append(idx)
-
-            rollout_bar.set_description(f"Rounds {rounds + 1}/{max_rounds} | Active agents per gpu: {len(not_done_idxs)}")
-            # users can customize different sampling_params at different run
-            with self.update_sampling_params(**kwargs):
-                output = self.inference_engine.generate(
-                    prompts=None,
-                    prompt_token_ids=generation_prompt_idxs,
-                    sampling_params=self.sampling_params,
-                    use_tqdm=False)
-            response_ids = output[0].tolist()
-            all_done_flag = True
+        env_clients = []
+        rollout_bar = None
+        try:
+            for _ in range(batch_size):
+                env_clients.append(init_env_client(self.agentgym_config))
             time.sleep(self.config.send_interval) # take a break before sendng request
-            if len(not_done_idxs) > 0:
-                with ThreadPoolExecutor(max_workers=len(not_done_idxs)) as executor:
-                    step_dones = list(executor.map(
-                        lambda args: agent_step(*args), [(i, idx) for i, idx in enumerate(not_done_idxs)]
-                    ))
-                    all_done_flag = all(step_dones)
-            rounds += 1
-            rollout_bar.update(1)
-        
-        # process ids
-        rollout_bar.close()
-        response_ids, response_attention_mask, response_position_ids, response_loss_mask = [], [], [], []
-        scores, messages = [], []
-        
-        for rollout_handler in rollout_handler_ls:
-            # check length
-            rollout_handler.truncate_output_ids()
-            assert len(rollout_handler.input_ids) == len(rollout_handler.attention_mask) == len(rollout_handler.position_ids) == len(rollout_handler.loss_mask), f"""Rollout Handler has different length of {len(rollout_handler.input_ids)=}, 
-            {len(rollout_handler.attention_mask)=}, {len(rollout_handler.position_ids)=}, {len(rollout_handler.loss_mask)=}"""
-            assert len(rollout_handler.input_ids) <= self.config.max_model_len, f"Rollout Handler has sequence length {len(rollout_handler.input_ids)} > max_sequence_length {self.config.max_model_len}"
+            all_done_flag = False
+            for idx, rollout_handler in enumerate(rollout_handler_ls):
+                try:
+                    env_clients[idx].reset(rollout_handler.item_id)
+                    task = env_clients[idx].observe()
+                    rollout_handler.add_user_message(self.tokenizer, task)
+                except TimeoutError:
+                    print(f"Reset Timeout: Webarena Env Timeout. item id = {rollout_handler.item_id}")
+                    rollout_handler.done = True
+                    rollout_handler.score = 0
 
-            response_ids.append(torch.tensor(rollout_handler.response_ids, dtype=torch.int, device=cur_device))
-            response_attention_mask.append(torch.tensor(rollout_handler.response_attention_mask, dtype=torch.int, device=cur_device))
-            response_position_ids.append(torch.tensor(rollout_handler.response_position_ids, dtype=torch.int, device=cur_device))
-            response_loss_mask.append(torch.tensor(rollout_handler.response_loss_mask, dtype=torch.int, device=cur_device))
-            scores.append(rollout_handler.score)
-            messages.append(rollout_handler.messages)
-        
-        # pad to length
-        response_ids = pad_sequence(response_ids, batch_first=True, padding_value=self.pad_token_id)
-        if response_ids.shape[1] < self.config.response_length:
-            response_ids = pad_sequence_to_length(response_ids, self.config.response_length, self.pad_token_id)
-        response_attention_mask = pad_sequence(response_attention_mask, batch_first=True, padding_value=0)
-        if response_attention_mask.shape[1] < self.config.response_length:
-            response_attention_mask = pad_sequence_to_length(response_attention_mask, self.config.response_length, 0)
-        response_loss_mask = pad_sequence(response_loss_mask, batch_first=True, padding_value=0)
-        if response_loss_mask.shape[1] < self.config.response_length:
-            response_loss_mask = pad_sequence_to_length(response_loss_mask, self.config.response_length, 0)
-        response_length = response_ids.size(1)
-        delta_position_ids = torch.arange(1, response_length + 1, device=cur_device)
-        delta_position_ids = delta_position_ids.unsqueeze(0).repeat(batch_size, 1)
-        input_ids = prompts.batch['input_ids']  # (bs, prompt_length)
-        prompt_length = input_ids.size(-1)
-        # left-padded attention_mask
-        attention_mask = prompts.batch['attention_mask']
-        position_ids = prompts.batch['position_ids']
-        input_ids = input_ids.repeat_interleave(self.config.n, dim=0)
-        attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
-        position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
-        response_position_ids = position_ids[:, -1:] + delta_position_ids
+            rounds = 0
+            task_rounds = [0] * batch_size
+            rollout_bar = tqdm(total = max_rounds, desc="Running rounds", disable=torch.distributed.get_rank() != 0)
+            def agent_step(i, idx):
+                content = self.tokenizer.decode(response_ids[i], skip_special_tokens=True)
+                rollout_handler_ls[idx].add_assistant_message(self.tokenizer, content)
+                task_rounds[idx] += 1
+                try:
+                    step_output = env_clients[idx].step(content)
+                    state, rollout_handler_ls[idx].score, rollout_handler_ls[idx].done = (
+                        step_output.state,
+                        step_output.reward,
+                        step_output.done,
+                    )
+                    rollout_handler_ls[idx].add_user_message(self.tokenizer, state)
+                    return step_output.done
+                except Exception as e:
+                    rollout_handler_ls[idx].score = 0
+                    rollout_handler_ls[idx].done = True
+                    print(f"Rollou step Error: {e} item id = {rollout_handler_ls[idx].item_id}")
+                    return True
+            while rounds < max_rounds and not all_done_flag:
+                # get generation prompt
+                generation_prompt_idxs = []
+                not_done_idxs = []
+                for idx, rollout_handler in enumerate(rollout_handler_ls):
+                    if not rollout_handler.done:
+                        generation_prompt_idxs.append(rollout_handler.get_generation_prompt(self.tokenizer))
+                        not_done_idxs.append(idx)
 
-        seq = torch.cat((input_ids, response_ids), dim=-1)
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
-        position_ids = torch.cat((position_ids, response_position_ids), dim=-1)
-        response_mask = response_loss_mask
+                rollout_bar.set_description(f"Rounds {rounds + 1}/{max_rounds} | Active agents per gpu: {len(not_done_idxs)}")
+                # users can customize different sampling_params at different run
+                with self.update_sampling_params(**kwargs):
+                    output = self.inference_engine.generate(
+                        prompts=None,
+                        prompt_token_ids=generation_prompt_idxs,
+                        sampling_params=self.sampling_params,
+                        use_tqdm=False)
+                response_ids = output[0].tolist()
+                all_done_flag = True
+                time.sleep(self.config.send_interval) # take a break before sendng request
+                if len(not_done_idxs) > 0:
+                    with ThreadPoolExecutor(max_workers=len(not_done_idxs)) as executor:
+                        step_dones = list(executor.map(
+                            lambda args: agent_step(*args), [(i, idx) for i, idx in enumerate(not_done_idxs)]
+                        ))
+                        all_done_flag = all(step_dones)
+                rounds += 1
+                rollout_bar.update(1)
+            
+            # process ids
+            rollout_bar.close()
+            rollout_bar = None
+            response_ids, response_attention_mask, response_position_ids, response_loss_mask = [], [], [], []
+            scores, messages = [], []
+            
+            for rollout_handler in rollout_handler_ls:
+                # check length
+                rollout_handler.truncate_output_ids()
+                assert len(rollout_handler.input_ids) == len(rollout_handler.attention_mask) == len(rollout_handler.position_ids) == len(rollout_handler.loss_mask), f"""Rollout Handler has different length of {len(rollout_handler.input_ids)=}, 
+                {len(rollout_handler.attention_mask)=}, {len(rollout_handler.position_ids)=}, {len(rollout_handler.loss_mask)=}"""
+                assert len(rollout_handler.input_ids) <= self.config.max_model_len, f"Rollout Handler has sequence length {len(rollout_handler.input_ids)} > max_sequence_length {self.config.max_model_len}"
 
-        reward_tensor = torch.zeros_like(response_ids, dtype=torch.float32) # (bs, response_length)
-        valid_response_length = attention_mask[:, prompt_length:].sum(dim=-1)
-        for i in range(len(scores)):
-            reward_tensor[i, valid_response_length[i].item() - 1] = scores[i]
+                response_ids.append(torch.tensor(rollout_handler.response_ids, dtype=torch.int, device=cur_device))
+                response_attention_mask.append(torch.tensor(rollout_handler.response_attention_mask, dtype=torch.int, device=cur_device))
+                response_position_ids.append(torch.tensor(rollout_handler.response_position_ids, dtype=torch.int, device=cur_device))
+                response_loss_mask.append(torch.tensor(rollout_handler.response_loss_mask, dtype=torch.int, device=cur_device))
+                scores.append(rollout_handler.score)
+                messages.append(rollout_handler.messages)
+            
+            # pad to length
+            response_ids = pad_sequence(response_ids, batch_first=True, padding_value=self.pad_token_id)
+            if response_ids.shape[1] < self.config.response_length:
+                response_ids = pad_sequence_to_length(response_ids, self.config.response_length, self.pad_token_id)
+            response_attention_mask = pad_sequence(response_attention_mask, batch_first=True, padding_value=0)
+            if response_attention_mask.shape[1] < self.config.response_length:
+                response_attention_mask = pad_sequence_to_length(response_attention_mask, self.config.response_length, 0)
+            response_loss_mask = pad_sequence(response_loss_mask, batch_first=True, padding_value=0)
+            if response_loss_mask.shape[1] < self.config.response_length:
+                response_loss_mask = pad_sequence_to_length(response_loss_mask, self.config.response_length, 0)
+            response_length = response_ids.size(1)
+            delta_position_ids = torch.arange(1, response_length + 1, device=cur_device)
+            delta_position_ids = delta_position_ids.unsqueeze(0).repeat(batch_size, 1)
+            input_ids = prompts.batch['input_ids']  # (bs, prompt_length)
+            prompt_length = input_ids.size(-1)
+            # left-padded attention_mask
+            attention_mask = prompts.batch['attention_mask']
+            position_ids = prompts.batch['position_ids']
+            input_ids = input_ids.repeat_interleave(self.config.n, dim=0)
+            attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
+            position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
+            response_position_ids = position_ids[:, -1:] + delta_position_ids
 
-        if global_steps:
-            try:
-                os.makedirs(os.path.join(self.config.rollout_log_dir, f"step{global_steps}"), exist_ok=True)
-                with open(os.path.join(self.config.rollout_log_dir, f"step{global_steps}/{torch.distributed.get_rank()}.json"), "w") as f:
-                    json_msg = []
-                    for idx, msgs in enumerate(messages):
-                        records = {
-                            "item_id": rollout_handler_ls[idx].item_id,
-                            "conversations": [msg.to_dict() for msg in msgs],
-                            "reward": scores[idx]
-                        }
-                        json_msg.append(records)
-                    json.dump(json_msg, f, ensure_ascii=True, indent=4)
-            except Exception as e:
-                print(e)
+            seq = torch.cat((input_ids, response_ids), dim=-1)
+            attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+            position_ids = torch.cat((position_ids, response_position_ids), dim=-1)
+            response_mask = response_loss_mask
 
-        # close clients
-        for client in env_clients:
-            try:
-                client.close()
-            except Exception as e:
-                print(f"Error during closing env: {e}")
+            reward_tensor = torch.zeros_like(response_ids, dtype=torch.float32) # (bs, response_length)
+            valid_response_length = attention_mask[:, prompt_length:].sum(dim=-1)
+            for i in range(len(scores)):
+                reward_tensor[i, valid_response_length[i].item() - 1] = scores[i]
+
+            if global_steps:
+                try:
+                    os.makedirs(os.path.join(self.config.rollout_log_dir, f"step{global_steps}"), exist_ok=True)
+                    with open(os.path.join(self.config.rollout_log_dir, f"step{global_steps}/{torch.distributed.get_rank()}.json"), "w") as f:
+                        json_msg = []
+                        for idx, msgs in enumerate(messages):
+                            records = {
+                                "item_id": rollout_handler_ls[idx].item_id,
+                                "conversations": [msg.to_dict() for msg in msgs],
+                                "reward": scores[idx]
+                            }
+                            json_msg.append(records)
+                        json.dump(json_msg, f, ensure_ascii=True, indent=4)
+                except Exception as e:
+                    print(e)
+        finally:
+            if rollout_bar is not None:
+                rollout_bar.close()
+            for client in env_clients:
+                try:
+                    client.close()
+                except Exception as e:
+                    print(f"Error during closing env: {e}")
 
         batch = TensorDict(
             {

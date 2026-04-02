@@ -95,6 +95,16 @@ class RLHFDataset(Dataset):
         # get agentgym client
         self.env_client = init_env_client(self.agentgym_config)
 
+    def close(self):
+        env_client = getattr(self, "env_client", None)
+        if env_client is not None:
+            try:
+                env_client.close()
+            except Exception as e:
+                logger.warning("failed to close dataset env client: %s", e)
+            finally:
+                self.env_client = None
+
     def _read_files_and_tokenize(self):
         self.dataframe = datasets.load_dataset("json", data_files=self.data_file)["train"]
         print(f"dataset len: {len(self.dataframe)}")
@@ -157,3 +167,9 @@ class RLHFDataset(Dataset):
             return state
 
         return self.__dict__.copy()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
