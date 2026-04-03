@@ -14,11 +14,14 @@ from agentenv.envs import (
     TodoEnvClient,
     WeatherEnvClient,
     WebarenaEnvClient,
-    WebServLiteEnvClient,
     WebshopEnvClient,
     WordleEnvClient,
     SearchQAEnvClient,
 )
+try:
+    from agentenv.envs import WebServLiteEnvClient
+except ImportError:
+    WebServLiteEnvClient = None
 
 def init_env_client(args):
     # task_name - task dict
