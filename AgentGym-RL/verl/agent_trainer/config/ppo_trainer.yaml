@@ -97,6 +97,29 @@ actor_rollout_ref:
     n: 1 # > 1 for grpo
     send_interval: 1 # # interval when sending request
     rollout_log_dir: null # Directory for storing rollout trajectories.
+  mclaw:
+    tree_rollout:
+      root_budget: 256       # Number of candidate actions sampled at root
+      n_envs: 16             # Number of parallel branches (environment instances)
+      root_clusters: 16      # Number of clusters for root candidate selection
+      branch_budget: 16      # Number of candidate actions per branch expansion
+      intra_branch_clusters: 4  # Number of clusters for intra-branch selection
+      max_rounds: 30         # Maximum number of tree expansion rounds
+    clustering:
+      method: hidden_state   # Clustering method: hidden_state, logprob, logit_distribution, output_grad
+      pca_dim: 128           # PCA dimensionality for clustering
+    q_critic:
+      hidden_dim: 3584       # Auto-detected from model config if available
+      intermediate_dim: 1024 # Q-head MLP intermediate dimension
+      lr: 1e-4               # Q-head learning rate
+      gamma: 0.99            # TD discount factor
+      update_freq: 1         # Q-head update frequency
+      grad_clip_norm: 1.0    # Q-head gradient clip norm
+      micro_batch_size: 32   # Micro-batch size for Q-critic forward pass
+    aux_loss:
+      coef: 0.2              # Auxiliary loss coefficient
+      use_same_advantage: true  # Use same advantage for auxiliary samples
+      weighting: equal_per_selected_cluster  # Weighting strategy for auxiliary samples
 
 critic:
   rollout_n: ${actor_rollout_ref.rollout.n}

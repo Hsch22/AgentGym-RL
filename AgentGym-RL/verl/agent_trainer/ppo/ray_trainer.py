@@ -186,6 +186,14 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
 
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == 'mclaw':
+        # MClaw computes tree-based advantages during rollout.
+        # They are already embedded in the DataProto by DataProtoAdapter.
+        # Just ensure returns exist (use advantages as fallback).
+        if 'advantages' not in data.batch.keys():
+            raise ValueError("MClaw rollout must populate advantages in DataProto")
+        if 'returns' not in data.batch.keys():
+            data.batch['returns'] = data.batch['advantages'].clone()
     else:
         raise NotImplementedError
     return data
@@ -426,6 +434,8 @@ class RayPPOTrainer(object):
             self.use_critic = False
         elif self.config.algorithm.adv_estimator == 'remax':
             self.use_critic = False
+        elif self.config.algorithm.adv_estimator == 'mclaw':
+            self.use_critic = False  # MClaw uses co-located Q-critic, not verl's CriticWorker
         else:
             raise NotImplementedError
 

@@ -288,19 +288,41 @@ class ActorRolloutRefWorker(Worker):
         assert self.world_size % infer_tp == 0, f'rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}'
         rollout_device_mesh = init_device_mesh('cuda', mesh_shape=(dp, infer_tp), mesh_dim_names=['dp', 'infer_tp'])
 
-        from verl.workers.rollout.agent_vllm_rollout import vLLMRollout
         from verl.workers.sharding_manager import FSDPVLLMShardingManager
-        log_gpu_memory_usage('Before building vllm rollout', logger=None)
-        rollout = vLLMRollout(actor_module=self.actor_module_fsdp,
-                                                 rollout_config=self.config.rollout,
-                                                 agentgym_config=self.config.agentgym,
-                                                 tokenizer=self.tokenizer,
-                                                 model_hf_config=self.actor_model_config)
-        log_gpu_memory_usage('After building vllm rollout', logger=None)
+
+        rollout_name = self.config.rollout.get('name', 'vllm')
+
+        if rollout_name == 'mclaw':
+            from verl.workers.rollout.mclaw_tree_rollout import MClawTreeRollout
+            log_gpu_memory_usage('Before building MClaw tree rollout', logger=None)
+            mclaw_config = self.config.get('mclaw', {})
+            rollout = MClawTreeRollout(
+                actor_module=self.actor_module_fsdp,
+                actor_module_fsdp=self.actor_module_fsdp,
+                rollout_config=self.config.rollout,
+                agentgym_config=self.config.agentgym,
+                mclaw_config=mclaw_config,
+                tokenizer=self.tokenizer,
+                model_hf_config=self.actor_model_config,
+            )
+            log_gpu_memory_usage('After building MClaw tree rollout', logger=None)
+            # For sharding manager, use the raw vLLM engine inside MClawTreeRollout
+            inference_engine = rollout.inference_engine_raw
+        else:
+            from verl.workers.rollout.agent_vllm_rollout import vLLMRollout
+            log_gpu_memory_usage('Before building vllm rollout', logger=None)
+            rollout = vLLMRollout(actor_module=self.actor_module_fsdp,
+                                                     rollout_config=self.config.rollout,
+                                                     agentgym_config=self.config.agentgym,
+                                                     tokenizer=self.tokenizer,
+                                                     model_hf_config=self.actor_model_config)
+            log_gpu_memory_usage('After building vllm rollout', logger=None)
+            inference_engine = rollout.inference_engine
+
         if torch.distributed.get_world_size() == 1:
             self.config.rollout.load_format = 'dummy_hf'
         rollout_sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
-                                                           inference_engine=rollout.inference_engine,
+                                                           inference_engine=inference_engine,
                                                            model_config=self.actor_model_config,
                                                            full_params='hf' in self.config.rollout.load_format,
                                                            device_mesh=rollout_device_mesh)
@@ -362,6 +384,33 @@ class ActorRolloutRefWorker(Worker):
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout()
 
+        # Build MClaw actor backend for joint PPO + auxiliary loss updates
+        self._mclaw_actor_backend = None
+        if self._is_actor and self.config.rollout.get('name', 'vllm') == 'mclaw':
+            try:
+                from mclaw.adapters import VerlActorBackend, DataProtoAdapter
+                mclaw_config = self.config.get('mclaw', {})
+                aux_loss_cfg = mclaw_config.get('aux_loss', {})
+                pad_token_id = self.tokenizer.pad_token_id or 0
+                adapter = DataProtoAdapter(pad_token_id=pad_token_id)
+                self._mclaw_actor_backend = VerlActorBackend(
+                    actor=self.actor,
+                    adapter=adapter,
+                    dataproto_meta_info={
+                        'micro_batch_size': self.config.actor.ppo_micro_batch_size_per_gpu or 1,
+                        'temperature': self.config.rollout.get('temperature', 1.0),
+                        'use_dynamic_bsz': self.config.actor.get('use_dynamic_bsz', False),
+                    },
+                    aux_loss_config={
+                        'coef': float(aux_loss_cfg.get('coef', 0.2)),
+                        'use_same_advantage': bool(aux_loss_cfg.get('use_same_advantage', True)),
+                        'weighting': str(aux_loss_cfg.get('weighting', 'equal_per_selected_cluster')),
+                    },
+                )
+                logger.info('MClaw VerlActorBackend initialized for joint PPO + auxiliary loss')
+            except ImportError:
+                logger.warning('mclaw not found, falling back to standard actor update')
+
         if self._is_ref:
             self.ref_module_fsdp = self._build_model_optimizer(model_path=self.config.model.path,
                                                                fsdp_config=self.config.ref.fsdp_config,
@@ -404,9 +453,12 @@ class ActorRolloutRefWorker(Worker):
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
-            # perform training
+            # perform training — MClaw path uses VerlActorBackend for joint PPO + aux loss
             with Timer(name='update_policy', logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
+                if self._mclaw_actor_backend is not None:
+                    metrics = self._mclaw_actor_backend.update_policy(data)
+                else:
+                    metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
             global_num_tokens = data.meta_info['global_token_num']
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
