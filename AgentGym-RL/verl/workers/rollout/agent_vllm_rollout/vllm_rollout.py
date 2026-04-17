@@ -51,6 +51,10 @@ from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
 from verl.utils.agentgym.client import init_env_client
 from verl.workers.rollout.schemas import RolloutHandler, Message, _pre_process_inputs
 
+import random
+from collections import defaultdict
+from verl.workers.rollout.agent_vllm_rollout import clustering as _clustering
+
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
@@ -132,6 +136,25 @@ class vLLMRollout(BaseRollout):
 
         self.tokenizer = tokenizer
 
+        # ==== clustering setup ====
+        self.clustering_config = getattr(rollout_config, 'clustering', None)
+        self.clustering_enabled = (
+            self.clustering_config is not None
+            and getattr(self.clustering_config, 'enabled', False)
+        )
+        self._actor_module_ref = actor_module
+        self._gradient_model = None
+        if self.clustering_enabled and self.clustering_config.method == "gradient":
+            from transformers import AutoModelForCausalLM
+            gradient_model_path = self.clustering_config.gradient_model_path
+            self._gradient_model = AutoModelForCausalLM.from_pretrained(
+                gradient_model_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="eager",
+            )
+            self._gradient_model.cuda()
+            self._gradient_model.eval()
+
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -148,6 +171,181 @@ class vLLMRollout(BaseRollout):
         # if len(old_sampling_params_args):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
+
+    def _sync_gradient_model_from_actor(self):
+        """Sync FSDP actor_module weights to the standalone gradient clustering model."""
+        if not self.clustering_enabled or self.clustering_config.method != "gradient":
+            return
+        if self._gradient_model is None:
+            return
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+        cfg = FullStateDictConfig(offload_to_cpu=False, rank0_only=False)
+        with FSDP.state_dict_type(self._actor_module_ref, StateDictType.FULL_STATE_DICT, cfg):
+            full_state = self._actor_module_ref.state_dict()
+        clean_state = {}
+        for k, v in full_state.items():
+            clean_state[k.replace("_fsdp_wrapped_module.", "")] = v
+        self._gradient_model.load_state_dict(clean_state, strict=False)
+        del full_state, clean_state
+        torch.cuda.empty_cache()
+
+    def _get_clustering_model(self):
+        method = self.clustering_config.method
+        if method == "gradient":
+            return self._gradient_model
+        if method == "semantic":
+            return self._actor_module_ref
+        raise ValueError(f"Unknown clustering method: {method}")
+
+    def _select_centers_with_grad(self, model, obs_token_ids, response_texts, k):
+        """Wrap clustering.select_centers with appropriate grad context."""
+        method = self.clustering_config.method
+        if method == "gradient":
+            with torch.enable_grad():
+                return _clustering.select_centers(
+                    method="gradient",
+                    model=model,
+                    tokenizer=self.tokenizer,
+                    obs_token_ids=obs_token_ids,
+                    response_texts=response_texts,
+                    k=k,
+                    d_proj=self.clustering_config.gradient_d_proj,
+                )
+        return _clustering.select_centers(
+            method="semantic",
+            model=model,
+            tokenizer=self.tokenizer,
+            obs_token_ids=obs_token_ids,
+            response_texts=response_texts,
+            k=k,
+        )
+
+    def _round0_clustering(self, rollout_handler_ls, env_clients, task_rounds, rounds, kwargs_sp):
+        """Round 0: generate round1_candidates per unique prompt, cluster to round1_clusters."""
+        groups = defaultdict(list)
+        for idx, handler in enumerate(rollout_handler_ls):
+            if not handler.done:
+                groups[handler.item_id].append(idx)
+
+        n_candidates = self.clustering_config.round1_candidates
+        n_clusters = self.clustering_config.round1_clusters
+        clustering_model = self._get_clustering_model()
+
+        for item_id, handler_idxs in groups.items():
+            representative = rollout_handler_ls[handler_idxs[0]]
+            gen_prompt = representative.get_generation_prompt(self.tokenizer)
+
+            # sample n_candidates via native vLLM n=K
+            sp_kwargs = dict(kwargs_sp)
+            sp_kwargs['n'] = n_candidates
+            with self.update_sampling_params(**sp_kwargs):
+                output = self.inference_engine.generate(
+                    prompts=None,
+                    prompt_token_ids=[gen_prompt],
+                    sampling_params=self.sampling_params,
+                    use_tqdm=False,
+                )
+            # output[0] is a padded tensor of shape (n_candidates, max_len)
+            all_response_ids = output[0].tolist()
+            all_response_texts = [
+                self.tokenizer.decode(r, skip_special_tokens=True) for r in all_response_ids
+            ]
+
+            # Filter to valid normalized actions only
+            valid_indices = [
+                i for i, t in enumerate(all_response_texts)
+                if _clustering.parse_valid_action(t) is not None
+            ]
+            valid_texts = [all_response_texts[i] for i in valid_indices]
+
+            # Cluster to n_clusters centers (assume len(valid_texts) >= n_clusters per plan)
+            center_local_idxs = self._select_centers_with_grad(
+                model=clustering_model,
+                obs_token_ids=gen_prompt,
+                response_texts=valid_texts,
+                k=n_clusters,
+            )
+            selected_response_texts = [valid_texts[i] for i in center_local_idxs]
+
+            # Assign one center to each handler and interact
+            time.sleep(self.config.send_interval)
+            for assign_i, hidx in enumerate(handler_idxs):
+                resp_text = selected_response_texts[assign_i]
+                handler = rollout_handler_ls[hidx]
+                handler.add_assistant_message(self.tokenizer, resp_text)
+                task_rounds[hidx] += 1
+                try:
+                    step_output = env_clients[hidx].step(resp_text)
+                    handler.score = step_output.reward
+                    handler.done = step_output.done
+                    if not step_output.done:
+                        handler.add_user_message(self.tokenizer, step_output.state)
+                except Exception as e:
+                    handler.score = 0
+                    handler.done = True
+                    print(f"Round 0 step Error: {e} item id = {handler.item_id}")
+
+    def _later_round_clustering(self, rollout_handler_ls, env_clients, task_rounds, rounds, kwargs_sp):
+        """Round 1+: each not-done handler generates later_candidates, cluster later_clusters, pick 1 random center."""
+        n_candidates = self.clustering_config.later_candidates
+        n_clusters = self.clustering_config.later_clusters
+        clustering_model = self._get_clustering_model()
+
+        not_done = [(idx, h) for idx, h in enumerate(rollout_handler_ls) if not h.done]
+        if not not_done:
+            return
+
+        time.sleep(self.config.send_interval)
+        for handler_idx, handler in not_done:
+            gen_prompt = handler.get_generation_prompt(self.tokenizer)
+
+            sp_kwargs = dict(kwargs_sp)
+            sp_kwargs['n'] = n_candidates
+            with self.update_sampling_params(**sp_kwargs):
+                output = self.inference_engine.generate(
+                    prompts=None,
+                    prompt_token_ids=[gen_prompt],
+                    sampling_params=self.sampling_params,
+                    use_tqdm=False,
+                )
+            all_response_ids = output[0].tolist()
+            all_response_texts = [
+                self.tokenizer.decode(r, skip_special_tokens=True) for r in all_response_ids
+            ]
+
+            valid_indices = [
+                i for i, t in enumerate(all_response_texts)
+                if _clustering.parse_valid_action(t) is not None
+            ]
+            valid_texts = [all_response_texts[i] for i in valid_indices]
+
+            if len(valid_texts) == 0:
+                # All invalid; fallback to first raw response (env will return error state)
+                chosen_text = all_response_texts[0]
+            else:
+                k_eff = min(n_clusters, len(valid_texts))
+                center_local_idxs = self._select_centers_with_grad(
+                    model=clustering_model,
+                    obs_token_ids=gen_prompt,
+                    response_texts=valid_texts,
+                    k=k_eff,
+                )
+                chosen_local = random.choice(center_local_idxs)
+                chosen_text = valid_texts[chosen_local]
+
+            handler.add_assistant_message(self.tokenizer, chosen_text)
+            task_rounds[handler_idx] += 1
+            try:
+                step_output = env_clients[handler_idx].step(chosen_text)
+                handler.score = step_output.reward
+                handler.done = step_output.done
+                if not step_output.done:
+                    handler.add_user_message(self.tokenizer, step_output.state)
+            except Exception as e:
+                handler.score = 0
+                handler.done = True
+                print(f"Round {rounds} step Error: {e} item id = {handler.item_id}")
 
     def preprocess_prompt_to_rollout_handler(self, prompts: DataProto, n: int) -> List[RolloutHandler]:
         assert "raw_prompt" in prompts.non_tensor_batch.keys(), "raw_prompt is not in non_tensor_batch, need to set data.return_raw_chat=True"
@@ -250,31 +448,42 @@ class vLLMRollout(BaseRollout):
                     print(f"Rollou step Error: {e} item id = {rollout_handler_ls[idx].item_id}")
                     return True
             while rounds < max_rounds and not all_done_flag:
-                # get generation prompt
-                generation_prompt_idxs = []
-                not_done_idxs = []
-                for idx, rollout_handler in enumerate(rollout_handler_ls):
-                    if not rollout_handler.done:
-                        generation_prompt_idxs.append(rollout_handler.get_generation_prompt(self.tokenizer))
-                        not_done_idxs.append(idx)
+                if self.clustering_enabled:
+                    if rounds == 0:
+                        self._sync_gradient_model_from_actor()
+                        rollout_bar.set_description(f"Rounds {rounds + 1}/{max_rounds} | Round 0 clustering")
+                        self._round0_clustering(rollout_handler_ls, env_clients, task_rounds, rounds, kwargs)
+                    else:
+                        active_cnt = sum(1 for h in rollout_handler_ls if not h.done)
+                        rollout_bar.set_description(f"Rounds {rounds + 1}/{max_rounds} | Active {active_cnt}")
+                        self._later_round_clustering(rollout_handler_ls, env_clients, task_rounds, rounds, kwargs)
+                    all_done_flag = all(h.done for h in rollout_handler_ls)
+                else:
+                    # get generation prompt
+                    generation_prompt_idxs = []
+                    not_done_idxs = []
+                    for idx, rollout_handler in enumerate(rollout_handler_ls):
+                        if not rollout_handler.done:
+                            generation_prompt_idxs.append(rollout_handler.get_generation_prompt(self.tokenizer))
+                            not_done_idxs.append(idx)
 
-                rollout_bar.set_description(f"Rounds {rounds + 1}/{max_rounds} | Active agents per gpu: {len(not_done_idxs)}")
-                # users can customize different sampling_params at different run
-                with self.update_sampling_params(**kwargs):
-                    output = self.inference_engine.generate(
-                        prompts=None,
-                        prompt_token_ids=generation_prompt_idxs,
-                        sampling_params=self.sampling_params,
-                        use_tqdm=False)
-                response_ids = output[0].tolist()
-                all_done_flag = True
-                time.sleep(self.config.send_interval) # take a break before sendng request
-                if len(not_done_idxs) > 0:
-                    with ThreadPoolExecutor(max_workers=len(not_done_idxs)) as executor:
-                        step_dones = list(executor.map(
-                            lambda args: agent_step(*args), [(i, idx) for i, idx in enumerate(not_done_idxs)]
-                        ))
-                        all_done_flag = all(step_dones)
+                    rollout_bar.set_description(f"Rounds {rounds + 1}/{max_rounds} | Active agents per gpu: {len(not_done_idxs)}")
+                    # users can customize different sampling_params at different run
+                    with self.update_sampling_params(**kwargs):
+                        output = self.inference_engine.generate(
+                            prompts=None,
+                            prompt_token_ids=generation_prompt_idxs,
+                            sampling_params=self.sampling_params,
+                            use_tqdm=False)
+                    response_ids = output[0].tolist()
+                    all_done_flag = True
+                    time.sleep(self.config.send_interval) # take a break before sendng request
+                    if len(not_done_idxs) > 0:
+                        with ThreadPoolExecutor(max_workers=len(not_done_idxs)) as executor:
+                            step_dones = list(executor.map(
+                                lambda args: agent_step(*args), [(i, idx) for i, idx in enumerate(not_done_idxs)]
+                            ))
+                            all_done_flag = all(step_dones)
                 rounds += 1
                 rollout_bar.update(1)
             

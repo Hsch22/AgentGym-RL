@@ -97,6 +97,15 @@ actor_rollout_ref:
     n: 1 # > 1 for grpo
     send_interval: 1 # # interval when sending request
     rollout_log_dir: null # Directory for storing rollout trajectories.
+    clustering:
+      enabled: false                  # Toggle clustering-based action selection
+      method: gradient                # "gradient" or "semantic"
+      round1_candidates: 64           # Candidates generated in round 0
+      round1_clusters: 8              # Cluster centers kept as parallel trajectories
+      later_candidates: 16            # Candidates generated per trajectory in later rounds
+      later_clusters: 4               # Clusters per trajectory in later rounds
+      gradient_d_proj: 512            # CountSketch projection dim for gradient clustering
+      gradient_model_path: models/Qwen2.5-7B-Instruct  # Standalone HF model for gradient clustering (P2)
   mclaw:
     tree_rollout:
       root_budget: 256       # Number of candidate actions sampled at root
