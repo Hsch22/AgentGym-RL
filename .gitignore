@@ -6,3 +6,6 @@ models/
 # Eval modules (not part of core)
 AgentEval/
 AgentItemId/
+
+# Logs
+*.log
