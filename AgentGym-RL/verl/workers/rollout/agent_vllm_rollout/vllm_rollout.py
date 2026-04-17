@@ -173,21 +173,30 @@ class vLLMRollout(BaseRollout):
             setattr(self.sampling_params, key, value)
 
     def _sync_gradient_model_from_actor(self):
-        """Sync FSDP actor_module weights to the standalone gradient clustering model."""
+        """Sync FSDP actor_module weights to the standalone gradient clustering model.
+
+        Uses offload_to_cpu=True to gather the state_dict on CPU, then copies
+        layer-by-layer onto the GPU gradient model to keep peak GPU memory low.
+        """
         if not self.clustering_enabled or self.clustering_config.method != "gradient":
             return
         if self._gradient_model is None:
             return
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import StateDictType, FullStateDictConfig
-        cfg = FullStateDictConfig(offload_to_cpu=False, rank0_only=False)
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
         with FSDP.state_dict_type(self._actor_module_ref, StateDictType.FULL_STATE_DICT, cfg):
             full_state = self._actor_module_ref.state_dict()
-        clean_state = {}
-        for k, v in full_state.items():
-            clean_state[k.replace("_fsdp_wrapped_module.", "")] = v
-        self._gradient_model.load_state_dict(clean_state, strict=False)
-        del full_state, clean_state
+        target_state = self._gradient_model.state_dict()
+        with torch.no_grad():
+            for k, cpu_tensor in full_state.items():
+                clean_k = k.replace("_fsdp_wrapped_module.", "")
+                tgt = target_state.get(clean_k)
+                if tgt is None:
+                    continue
+                tgt.copy_(cpu_tensor, non_blocking=True)
+        torch.cuda.synchronize()
+        del full_state, target_state
         torch.cuda.empty_cache()
 
     def _get_clustering_model(self):
