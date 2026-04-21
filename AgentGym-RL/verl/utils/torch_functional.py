@@ -110,6 +110,20 @@ def entropy_from_logits(logits: torch.Tensor):
     return entropy
 
 
+def entropy_from_logits_chunked(logits: torch.Tensor, chunk_size: int):
+    """Calculate entropy from logits row-wise in chunks to reduce peak memory."""
+    if chunk_size is None or chunk_size <= 0:
+        return entropy_from_logits(logits)
+
+    original_shape = logits.shape[:-1]
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    entropies = []
+    for start in range(0, flat_logits.shape[0], chunk_size):
+        chunk = flat_logits[start:start + chunk_size]
+        entropies.append(entropy_from_logits(chunk))
+    return torch.cat(entropies, dim=0).reshape(*original_shape)
+
+
 def masked_sum(values, mask, axis=None):
     """Compute mean of tensor with a masked values."""
     return (values * mask).sum(axis=axis)

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 import time
 from typing import Dict, List, Any, Tuple
 
@@ -22,6 +24,11 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy, Nod
 from ray.experimental.state.api import get_actor
 
 from verl.single_controller.base import WorkerGroup, ResourcePool, ClassWithInitArgs, Worker
+
+logger = logging.getLogger(__name__)
+
+# Gate verbose dispatch logging behind an env var so it doesn't spam unless asked.
+_DISPATCH_DEBUG = os.environ.get("VERL_DISPATCH_DEBUG", "1") not in ("", "0", "false", "False")
 
 __all__ = ['Worker']
 
@@ -346,9 +353,22 @@ class RayWorkerGroup(WorkerGroup):
                     sliced_kwargs = {k: v[i] for k, v in kwargs.items()}
                     remote_call = getattr(self._workers[i], method_name)
                     result.append(remote_call.remote(*sliced_args, **sliced_kwargs))
+                if _DISPATCH_DEBUG:
+                    logger.warning(
+                        f"[execute_all_async] method={method_name} path=sharded "
+                        f"fired {len(result)} RPCs on {length} workers "
+                        f"(world_size={self._world_size})"
+                    )
                 return result
 
-        return [getattr(worker, method_name).remote(*args, **kwargs) for worker in self._workers]
+        refs = [getattr(worker, method_name).remote(*args, **kwargs) for worker in self._workers]
+        if _DISPATCH_DEBUG:
+            logger.warning(
+                f"[execute_all_async] method={method_name} path=broadcast "
+                f"fired {len(refs)} RPCs on {length} workers "
+                f"(world_size={self._world_size})"
+            )
+        return refs
 
     @property
     def master_address(self):

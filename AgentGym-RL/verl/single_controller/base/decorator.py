@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from enum import Enum
 from functools import wraps
 from typing import Dict, List, Tuple
 from types import FunctionType
 from verl.protocol import DataProtoFuture
+
+logger = logging.getLogger(__name__)
+
+# Gate verbose dispatch logging behind an env var so it doesn't spam unless asked.
+_DISPATCH_DEBUG = os.environ.get("VERL_DISPATCH_DEBUG", "1") not in ("", "0", "false", "False")
 
 # here we add a magic number of avoid user-defined function already have this attribute
 MAGIC_ATTR = 'attrs_3141562937'
@@ -273,6 +280,15 @@ def dispatch_dp_compute_data_proto(worker_group, *args, **kwargs):
     from verl.single_controller.base.worker_group import WorkerGroup
     assert isinstance(worker_group, WorkerGroup)
     splitted_args, splitted_kwargs = _split_args_kwargs_data_proto(worker_group.world_size, *args, **kwargs)
+    if _DISPATCH_DEBUG:
+        # splitted_args is a list of per-arg chunk-lists; each chunk-list has world_size entries.
+        arg_chunks = [len(a) for a in splitted_args]
+        kwarg_chunks = {k: len(v) for k, v in splitted_kwargs.items()}
+        target_workers = len(getattr(worker_group, "workers", []) or [])
+        logger.warning(
+            f"[dispatch_dp] world_size={worker_group.world_size} "
+            f"arg_chunks={arg_chunks} kwarg_chunks={kwarg_chunks} target_workers={target_workers}"
+        )
     return splitted_args, splitted_kwargs
 
 
@@ -283,6 +299,14 @@ def dispatch_dp_compute_data_proto_with_func(worker_group, *args, **kwargs):
 
     splitted_args, splitted_kwargs = _split_args_kwargs_data_proto(worker_group.world_size, *args[1:], **kwargs)
     splitted_args_with_func = [[args[0]] * worker_group.world_size] + splitted_args
+    if _DISPATCH_DEBUG:
+        arg_chunks = [len(a) for a in splitted_args_with_func]
+        kwarg_chunks = {k: len(v) for k, v in splitted_kwargs.items()}
+        target_workers = len(getattr(worker_group, "workers", []) or [])
+        logger.warning(
+            f"[dispatch_dp_with_func] world_size={worker_group.world_size} "
+            f"arg_chunks={arg_chunks} kwarg_chunks={kwarg_chunks} target_workers={target_workers}"
+        )
     return splitted_args_with_func, splitted_kwargs
 
 

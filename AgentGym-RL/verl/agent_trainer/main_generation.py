@@ -46,8 +46,12 @@ def main(config):
     from omegaconf import OmegaConf
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
+    # RayResourcePool reserves `max_collocate_count` CPUs per GPU worker bundle.
+    # main_generation launches one rollout worker per visible GPU, so ensure the
+    # local Ray instance exposes enough CPU resources for placement groups.
+    required_cpus = max(8 * config.trainer.nnodes, 5 * config.trainer.n_gpus_per_node * config.trainer.nnodes)
     ray.init(num_gpus=config.trainer.n_gpus_per_node * config.trainer.nnodes,
-             num_cpus=8 * config.trainer.nnodes,
+             num_cpus=required_cpus,
              ignore_reinit_error=True)
     local_path = copy_local_path_from_hdfs(config.model.path)
     from verl.utils import hf_tokenizer
@@ -96,8 +100,13 @@ def main(config):
             batch_item_ids = item_ids[start_idx: end_idx]
             single_messages = [{"role": "user", "content": env_client.conversation_start[0]["value"]},
                                {"role": "assistant", "content": env_client.conversation_start[1]["value"]}]
-            single_prompt = tokenizer.apply_chat_template(
-                single_messages, tokenize=False, add_generation_prompt=False,
+            # Keep evaluation prompts aligned with RL training prompts. The rollout
+            # handler expects the Qwen-style prompt to end exactly at `<|im_end|>`
+            # after the assistant bootstrap message.
+            single_prompt = (
+                "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
+                f"<|im_start|>user\n{env_client.conversation_start[0]['value']}<|im_end|>\n"
+                f"<|im_start|>assistant\n{env_client.conversation_start[1]['value']}<|im_end|>"
             )
             prompt_with_chat_template = [single_prompt for _ in range(len(batch_item_ids))]
             messages = [list(single_messages) for _ in range(len(batch_item_ids))]
@@ -145,17 +154,20 @@ def main(config):
         print("============Total Task Evaluation============")
         print(f"Avg@{config.data.n_samples}: {np.mean(output_np)}")
         print(f"Pass@{config.data.n_samples}: {np.mean(np.max(output_np, axis=-1) > 0)}")
-        print("============Sub Task Evaluation============")
-        
-        category_success_bucket = defaultdict(list)
-        for item_id, score in zip(item_ids, output_lst):
-            category = category_map[item_id]
-            category_success_bucket[category].append(score)
-        for category_file in category_files:
-            category = category_file.split(".")[0]
-            print(f"Category: {category}")
-            print(f"Avg@{config.data.n_samples}: {np.mean(np.array(category_success_bucket[category]))}")
-            print(f"Pass@{config.data.n_samples}: {np.mean(np.max(np.array(category_success_bucket[category]), axis=-1) > 0)}")
+        if category_files:
+            print("============Sub Task Evaluation============")
+            category_success_bucket = defaultdict(list)
+            for item_id, score in zip(item_ids, output_lst):
+                category = category_map.get(item_id)
+                if category is not None:
+                    category_success_bucket[category].append(score)
+            for category_file in category_files:
+                category = category_file.split(".")[0]
+                if not category_success_bucket.get(category):
+                    continue
+                print(f"Category: {category}")
+                print(f"Avg@{config.data.n_samples}: {np.mean(np.array(category_success_bucket[category]))}")
+                print(f"Pass@{config.data.n_samples}: {np.mean(np.max(np.array(category_success_bucket[category]), axis=-1) > 0)}")
     finally:
         if env_client is not None:
             try:

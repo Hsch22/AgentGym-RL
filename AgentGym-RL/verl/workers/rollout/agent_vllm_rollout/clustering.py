@@ -17,6 +17,7 @@ select_centers(method, model, tokenizer, ...)    -> List[int]
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
@@ -30,6 +31,8 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 
 _CENTER_TIE_BREAK_EPS = 1e-4
+_DEFAULT_SEMANTIC_CHUNK_SIZE = 4
+_SEMANTIC_CHUNK_ENV = "VERL_SEMANTIC_CLUSTER_CHUNK_SIZE"
 
 
 @dataclass(frozen=True)
@@ -404,9 +407,14 @@ def select_centers_semantic(
 ) -> List[int]:
     """Select k cluster-center indices using semantic (hidden-state) clustering.
 
-    Builds a padded batch of ``[prompt + response]`` sequences, runs a
-    no-grad forward pass to get the last hidden layer, mean-pools the
-    response token embeddings, L2-normalises, then runs greedy k-center.
+    Builds padded ``[prompt + response]`` sequences, runs chunked no-grad
+    forward passes to get the last hidden layer, mean-pools the response token
+    embeddings, L2-normalises, then runs greedy k-center.
+
+    The chunking is intentionally conservative: semantic clustering is an
+    auxiliary path, and stability matters more than throughput. If a chunk
+    still OOMs, this function recursively halves it until it succeeds or only a
+    single candidate remains.
 
     Parameters
     ----------
@@ -437,40 +445,96 @@ def select_centers_semantic(
         full_ids_list.append(obs_ids + [int(x) for x in resp_ids])
         resp_lens.append(len(resp_ids))
 
-    max_len = max(len(x) for x in full_ids_list)
     N = len(full_ids_list)
-    input_ids = torch.full((N, max_len), pad_id, dtype=torch.long, device=device)
-    attention_mask = torch.zeros(N, max_len, dtype=torch.long, device=device)
-    spans: List[Tuple[int, int]] = []
-    for i, ids in enumerate(full_ids_list):
-        L = len(ids)
-        pad_len = max_len - L
-        input_ids[i, pad_len:] = torch.tensor(ids, dtype=torch.long, device=device)
-        attention_mask[i, pad_len:] = 1
-        resp_start = pad_len + obs_len
-        spans.append((resp_start, resp_start + resp_lens[i]))
 
-    position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+    # Skip candidates whose response tokenized to empty — mean over an empty
+    # span returns NaN and poisons k-center. Keep a map back to the original
+    # response_texts index so callers can index into their own list.
+    pooled_list: List[torch.Tensor] = []
+    original_indices: List[int] = []
 
-    with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            output_hidden_states=True,
-        )
+    def _empty_cuda_cache() -> None:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
-    last_hidden = outputs.hidden_states[-1]  # [N, seq_len, hidden_dim]
+    def _get_semantic_chunk_size(num_candidates: int) -> int:
+        raw = os.environ.get(_SEMANTIC_CHUNK_ENV)
+        if raw is not None:
+            try:
+                return max(1, min(num_candidates, int(raw)))
+            except ValueError:
+                pass
+        return min(num_candidates, _DEFAULT_SEMANTIC_CHUNK_SIZE)
 
-    pooled_list = []
-    for i, (start, end) in enumerate(spans):
-        pooled_list.append(last_hidden[i, start:end, :].mean(dim=0))
-    pooled = torch.stack(pooled_list, dim=0).float()  # [N, hidden_dim]
+    def _process_slice(start_idx: int, end_idx: int) -> Tuple[List[torch.Tensor], List[int]]:
+        chunk_size = end_idx - start_idx
+        chunk_full_ids = full_ids_list[start_idx:end_idx]
+        chunk_resp_lens = resp_lens[start_idx:end_idx]
+        max_len = max(len(ids) for ids in chunk_full_ids)
+
+        input_ids = torch.full((chunk_size, max_len), pad_id, dtype=torch.long, device=device)
+        attention_mask = torch.zeros((chunk_size, max_len), dtype=torch.long, device=device)
+        spans: List[Tuple[int, int]] = []
+        for local_i, ids in enumerate(chunk_full_ids):
+            seq_len = len(ids)
+            pad_len = max_len - seq_len
+            input_ids[local_i, pad_len:] = torch.tensor(ids, dtype=torch.long, device=device)
+            attention_mask[local_i, pad_len:] = 1
+            resp_start = pad_len + obs_len
+            spans.append((resp_start, resp_start + chunk_resp_lens[local_i]))
+
+        position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+
+        try:
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    output_hidden_states=True,
+                )
+            last_hidden = outputs.hidden_states[-1]  # [chunk, seq_len, hidden_dim]
+        except torch.OutOfMemoryError:
+            del input_ids, attention_mask, position_ids
+            _empty_cuda_cache()
+            if chunk_size == 1:
+                raise
+            mid = start_idx + chunk_size // 2
+            left_pooled, left_indices = _process_slice(start_idx, mid)
+            right_pooled, right_indices = _process_slice(mid, end_idx)
+            return left_pooled + right_pooled, left_indices + right_indices
+
+        pooled_chunk: List[torch.Tensor] = []
+        original_indices_chunk: List[int] = []
+        for local_i, (start, end) in enumerate(spans):
+            if end <= start:
+                continue
+            pooled_chunk.append(last_hidden[local_i, start:end, :].mean(dim=0).float().cpu())
+            original_indices_chunk.append(start_idx + local_i)
+
+        del outputs, last_hidden, input_ids, attention_mask, position_ids
+        _empty_cuda_cache()
+        return pooled_chunk, original_indices_chunk
+
+    semantic_chunk_size = _get_semantic_chunk_size(N)
+    for start_idx in range(0, N, semantic_chunk_size):
+        end_idx = min(start_idx + semantic_chunk_size, N)
+        chunk_pooled, chunk_indices = _process_slice(start_idx, end_idx)
+        pooled_list.extend(chunk_pooled)
+        original_indices.extend(chunk_indices)
+
+    if len(pooled_list) == 0:
+        # Degenerate: every response was empty. Return first min(k, N) raw
+        # indices as best-effort — caller will feed them to env.step, which
+        # typically rejects empty actions.
+        return list(range(min(k, N)))
+
+    pooled = torch.stack(pooled_list, dim=0).float()  # [M, hidden_dim], M <= N
     pooled = F.normalize(pooled, p=2, dim=-1)
 
-    effective_k = min(k, N)
+    effective_k = min(k, len(pooled_list))
     result = kcenter_greedy(pooled, effective_k, initial_center_index=0)
-    return result.center_indices
+    return [original_indices[i] for i in result.center_indices]
 
 
 def select_centers(

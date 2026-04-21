@@ -42,6 +42,7 @@ from verl.third_party.vllm import parallel_state as vllm_ps
 from vllm import SamplingParams
 
 import os
+import sys
 import json
 import time
 import requests
@@ -136,6 +137,15 @@ class vLLMRollout(BaseRollout):
 
         self.tokenizer = tokenizer
 
+        # ==== rank (for per-rank rollout logging) ====
+        try:
+            if torch.distributed.is_initialized():
+                self._rank = torch.distributed.get_rank()
+            else:
+                self._rank = int(os.environ.get("RANK", "0"))
+        except Exception:
+            self._rank = int(os.environ.get("RANK", "0"))
+
         # ==== clustering setup ====
         self.clustering_config = getattr(rollout_config, 'clustering', None)
         self.clustering_enabled = (
@@ -144,7 +154,35 @@ class vLLMRollout(BaseRollout):
         )
         self._actor_module_ref = actor_module
         self._gradient_model = None
-        if self.clustering_enabled and self.clustering_config.method == "gradient":
+        if self.clustering_enabled:
+            method = getattr(self.clustering_config, "method", None)
+            round1_candidates = int(getattr(self.clustering_config, "round1_candidates"))
+            round1_clusters = int(getattr(self.clustering_config, "round1_clusters"))
+            later_candidates = int(getattr(self.clustering_config, "later_candidates"))
+            later_clusters = int(getattr(self.clustering_config, "later_clusters"))
+            if method not in ("gradient", "semantic"):
+                raise ValueError(f"unsupported clustering method: {method}")
+            assert round1_candidates >= round1_clusters >= 1, (
+                f"invalid round0 clustering config: {round1_candidates=} {round1_clusters=}"
+            )
+            assert later_candidates >= later_clusters >= 1, (
+                f"invalid later-round clustering config: {later_candidates=} {later_clusters=}"
+            )
+            assert round1_clusters == int(self.config.n), (
+                f"round0 clustering must match rollout.n so each repeated trajectory gets one center: "
+                f"{round1_clusters=} rollout.n={self.config.n}"
+            )
+            print(
+                "[clustering-config] "
+                f"method={method} "
+                f"round0={round1_candidates}/{round1_clusters} "
+                f"later={later_candidates}/{later_clusters}"
+            )
+        # Both gradient and semantic clustering need a standalone (non-FSDP) HF copy.
+        # Semantic used to call model(...) on the FSDP actor directly; that triggers
+        # an all_gather collective under divergent control flow (ranks that finish
+        # their rollout early never enter the call) and deadlocks.
+        if self.clustering_enabled and self.clustering_config.method in ("gradient", "semantic"):
             from transformers import AutoModelForCausalLM
             gradient_model_path = self.clustering_config.gradient_model_path
             self._gradient_model = AutoModelForCausalLM.from_pretrained(
@@ -152,8 +190,14 @@ class vLLMRollout(BaseRollout):
                 torch_dtype=torch.bfloat16,
                 attn_implementation="eager",
             )
-            self._gradient_model.cuda()
+            # Keep on CPU initially to avoid competing with vLLM KV cache + FSDP
+            # state_dict gather during compute_log_prob / update_actor. Moved to
+            # GPU at sync time (round 0) and offloaded back at end of rollout.
+            self._gradient_model.cpu()
             self._gradient_model.eval()
+            # Gradient method needs backward through params; explicit for safety.
+            for p in self._gradient_model.parameters():
+                p.requires_grad_(True)
 
 
     @contextmanager
@@ -173,12 +217,16 @@ class vLLMRollout(BaseRollout):
             setattr(self.sampling_params, key, value)
 
     def _sync_gradient_model_from_actor(self):
-        """Sync FSDP actor_module weights to the standalone gradient clustering model.
+        """Sync FSDP actor_module weights to the standalone clustering model.
 
-        Uses offload_to_cpu=True to gather the state_dict on CPU, then copies
-        layer-by-layer onto the GPU gradient model to keep peak GPU memory low.
+        Called at the start of each rollout (rounds==0), after PPO has updated
+        the actor. Runs on all ranks in lockstep — safe because every rank enters
+        generate_sequences together and hits round 0 before any divergence.
+        Covers both gradient and semantic methods.
         """
-        if not self.clustering_enabled or self.clustering_config.method != "gradient":
+        if not self.clustering_enabled:
+            return
+        if self.clustering_config.method not in ("gradient", "semantic"):
             return
         if self._gradient_model is None:
             return
@@ -189,22 +237,30 @@ class vLLMRollout(BaseRollout):
             full_state = self._actor_module_ref.state_dict()
         target_state = self._gradient_model.state_dict()
         with torch.no_grad():
-            for k, cpu_tensor in full_state.items():
+            for k in list(full_state.keys()):
+                cpu_tensor = full_state.pop(k)
                 clean_k = k.replace("_fsdp_wrapped_module.", "")
                 tgt = target_state.get(clean_k)
                 if tgt is None:
+                    del cpu_tensor
                     continue
                 tgt.copy_(cpu_tensor, non_blocking=True)
+                del cpu_tensor
+        full_state.clear()
         torch.cuda.synchronize()
         del full_state, target_state
+        # Move clustering model to GPU for the upcoming round-0 + later-round calls.
+        if next(self._gradient_model.parameters()).device.type == "cpu":
+            self._gradient_model.cuda()
         torch.cuda.empty_cache()
 
     def _get_clustering_model(self):
         method = self.clustering_config.method
-        if method == "gradient":
+        if method in ("gradient", "semantic"):
+            # Both routes use the standalone non-FSDP copy to avoid collective
+            # deadlock in divergent-control-flow paths (some ranks exit rollout
+            # early while others still call model(...)).
             return self._gradient_model
-        if method == "semantic":
-            return self._actor_module_ref
         raise ValueError(f"Unknown clustering method: {method}")
 
     def _select_centers_with_grad(self, model, obs_token_ids, response_texts, k):
@@ -261,26 +317,36 @@ class vLLMRollout(BaseRollout):
                 self.tokenizer.decode(r, skip_special_tokens=True) for r in all_response_ids
             ]
 
-            # Filter to valid normalized actions only
+            # Filter to valid normalized actions only.
+            # Note: clustering input = raw response text (full Thought+Action), not
+            # the normalized action — Thought adds semantic signal for diversity;
+            # env.step still receives the raw text downstream.
             valid_indices = [
                 i for i, t in enumerate(all_response_texts)
                 if _clustering.parse_valid_action(t) is not None
             ]
             valid_texts = [all_response_texts[i] for i in valid_indices]
 
-            # Cluster to n_clusters centers (assume len(valid_texts) >= n_clusters per plan)
-            center_local_idxs = self._select_centers_with_grad(
-                model=clustering_model,
-                obs_token_ids=gen_prompt,
-                response_texts=valid_texts,
-                k=n_clusters,
-            )
-            selected_response_texts = [valid_texts[i] for i in center_local_idxs]
+            # Cluster to min(n_clusters, len(valid_texts)); fall back to first raw
+            # text cycled across handlers when all candidates parse-fail.
+            if len(valid_texts) == 0:
+                selected_response_texts = [all_response_texts[0]]
+            else:
+                k_eff = min(n_clusters, len(valid_texts))
+                center_local_idxs = self._select_centers_with_grad(
+                    model=clustering_model,
+                    obs_token_ids=gen_prompt,
+                    response_texts=valid_texts,
+                    k=k_eff,
+                )
+                selected_response_texts = [valid_texts[i] for i in center_local_idxs]
 
-            # Assign one center to each handler and interact
+            # Assign one center to each handler and interact. Cycle with modulo when
+            # len(handler_idxs) > len(selected_response_texts) (e.g., rollout.n > 1
+            # or collapsed candidate pool).
             time.sleep(self.config.send_interval)
             for assign_i, hidx in enumerate(handler_idxs):
-                resp_text = selected_response_texts[assign_i]
+                resp_text = selected_response_texts[assign_i % len(selected_response_texts)]
                 handler = rollout_handler_ls[hidx]
                 handler.add_assistant_message(self.tokenizer, resp_text)
                 task_rounds[hidx] += 1
@@ -438,6 +504,12 @@ class vLLMRollout(BaseRollout):
             rounds = 0
             task_rounds = [0] * batch_size
             rollout_bar = tqdm(total = max_rounds, desc="Running rounds", disable=torch.distributed.get_rank() != 0)
+            _rollout_rank = getattr(self, "_rank", int(os.environ.get("RANK", "0")))
+            _rollout_wall_start = time.time()
+            print(
+                f"[rollout] rank={_rollout_rank} START batch_size={batch_size} max_rounds={max_rounds} t={_rollout_wall_start:.1f}",
+                file=sys.stderr, flush=True,
+            )
             def agent_step(i, idx):
                 content = self.tokenizer.decode(response_ids[i], skip_special_tokens=True)
                 rollout_handler_ls[idx].add_assistant_message(self.tokenizer, content)
@@ -457,6 +529,13 @@ class vLLMRollout(BaseRollout):
                     print(f"Rollou step Error: {e} item id = {rollout_handler_ls[idx].item_id}")
                     return True
             while rounds < max_rounds and not all_done_flag:
+                _round_start_done = sum(1 for h in rollout_handler_ls if h.done)
+                _round_start_active = batch_size - _round_start_done
+                print(
+                    f"[rollout] rank={_rollout_rank} round={rounds}/{max_rounds} "
+                    f"active={_round_start_active}/{batch_size} t={time.time():.1f}",
+                    file=sys.stderr, flush=True,
+                )
                 if self.clustering_enabled:
                     if rounds == 0:
                         self._sync_gradient_model_from_actor()
@@ -493,9 +572,34 @@ class vLLMRollout(BaseRollout):
                                 lambda args: agent_step(*args), [(i, idx) for i, idx in enumerate(not_done_idxs)]
                             ))
                             all_done_flag = all(step_dones)
+                _round_end_done = sum(1 for h in rollout_handler_ls if h.done)
+                _newly_done = _round_end_done - _round_start_done
+                print(
+                    f"[rollout] rank={_rollout_rank} round={rounds} "
+                    f"done_in_round={_newly_done} total_done={_round_end_done}/{batch_size} "
+                    f"t={time.time():.1f}",
+                    file=sys.stderr, flush=True,
+                )
                 rounds += 1
                 rollout_bar.update(1)
-            
+            _final_done = sum(1 for h in rollout_handler_ls if h.done)
+            _elapsed = time.time() - _rollout_wall_start
+            print(
+                f"[rollout] rank={_rollout_rank} FINISHED total_rounds={rounds} "
+                f"total_done={_final_done}/{batch_size} wall={_elapsed:.1f}s",
+                file=sys.stderr, flush=True,
+            )
+
+            # Offload clustering model to CPU so compute_log_prob / update_actor
+            # don't fight its ~6GB against FSDP all-gather peaks. Re-uploaded at
+            # next round-0 inside _sync_gradient_model_from_actor.
+            if (
+                self._gradient_model is not None
+                and next(self._gradient_model.parameters()).device.type == "cuda"
+            ):
+                self._gradient_model.cpu()
+                torch.cuda.empty_cache()
+
             # process ids
             rollout_bar.close()
             rollout_bar = None

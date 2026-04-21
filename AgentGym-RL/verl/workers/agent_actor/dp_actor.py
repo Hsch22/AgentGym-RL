@@ -16,6 +16,7 @@ Single Process Actor
 """
 
 import itertools
+import os
 from typing import Tuple
 
 import torch
@@ -26,7 +27,7 @@ from verl import DataProto
 from verl.agent_trainer.ppo import core_algos
 from verl.workers.agent_actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
-from verl.utils.torch_functional import logprobs_from_logits, masked_mean
+from verl.utils.torch_functional import logprobs_from_logits, masked_mean, entropy_from_logits_chunked
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
@@ -49,7 +50,10 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
         self.use_remove_padding = self.config.get('use_remove_padding', False)
+        self.entropy_chunk_size = int(os.environ.get('VERL_ENTROPY_CHUNK_SIZE', self.config.get('entropy_chunk_size', 0) or 0))
         print(f'Actor use_remove_padding={self.use_remove_padding}')
+        if self.entropy_chunk_size > 0:
+            print(f'Actor entropy_chunk_size={self.entropy_chunk_size}')
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
@@ -100,7 +104,10 @@ class DataParallelPPOActor(BasePPOActor):
                 logits_rmpad.div_(temperature)
 
                 # compute entropy
-                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                if self.entropy_chunk_size > 0:
+                    entropy_rmpad = entropy_from_logits_chunked(logits_rmpad, self.entropy_chunk_size)
+                else:
+                    entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                 log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
@@ -136,7 +143,10 @@ class DataParallelPPOActor(BasePPOActor):
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                if self.entropy_chunk_size > 0:
+                    entropy = entropy_from_logits_chunked(logits, self.entropy_chunk_size)
+                else:
+                    entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
             return entropy, log_probs
 

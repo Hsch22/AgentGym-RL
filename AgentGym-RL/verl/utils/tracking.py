@@ -65,7 +65,6 @@ class Tracking(object):
 
         if "swanlab" in default_backend:
             import swanlab
-            import os
 
             SWANLAB_API_KEY = os.environ.get("SWANLAB_API_KEY", None)
             SWANLAB_LOG_DIR = os.environ.get("SWANLAB_LOG_DIR", "swanlog")
