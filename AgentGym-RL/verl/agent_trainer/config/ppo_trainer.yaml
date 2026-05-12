@@ -99,7 +99,7 @@ actor_rollout_ref:
     rollout_log_dir: null # Directory for storing rollout trajectories.
     clustering:
       enabled: false                  # Toggle clustering-based action selection
-      method: gradient                # "gradient" or "semantic"
+      method: gradient                # "gradient", "semantic", "random_valid", or "random_raw"
       round1_candidates: 64           # Candidates generated in round 0
       round1_clusters: 8              # Cluster centers kept as parallel trajectories
       later_candidates: 16            # Candidates generated per trajectory in later rounds
@@ -222,6 +222,7 @@ trainer:
   resume_mode: auto # or auto or resume_path if 
   resume_from_path: False
   test_freq: -1
+  test_batches: 1
   critic_warmup: 0
   default_hdfs_dir: null
   remove_previous_ckpt_in_save: False

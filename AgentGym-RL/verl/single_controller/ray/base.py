@@ -27,8 +27,8 @@ from verl.single_controller.base import WorkerGroup, ResourcePool, ClassWithInit
 
 logger = logging.getLogger(__name__)
 
-# Gate verbose dispatch logging behind an env var so it doesn't spam unless asked.
-_DISPATCH_DEBUG = os.environ.get("VERL_DISPATCH_DEBUG", "1") not in ("", "0", "false", "False")
+# 注意：dispatch 调试日志通过环境变量控制，默认关闭以免训练日志被 RPC 分片信息刷屏。
+_DISPATCH_DEBUG = os.environ.get("VERL_DISPATCH_DEBUG", "0") not in ("", "0", "false", "False")
 
 __all__ = ['Worker']
 
@@ -354,6 +354,7 @@ class RayWorkerGroup(WorkerGroup):
                     remote_call = getattr(self._workers[i], method_name)
                     result.append(remote_call.remote(*sliced_args, **sliced_kwargs))
                 if _DISPATCH_DEBUG:
+                    # 原因：明确 sharded 路径发出的 RPC 数，排查 DP chunk 与 worker 数不一致。
                     logger.warning(
                         f"[execute_all_async] method={method_name} path=sharded "
                         f"fired {len(result)} RPCs on {length} workers "
@@ -363,6 +364,7 @@ class RayWorkerGroup(WorkerGroup):
 
         refs = [getattr(worker, method_name).remote(*args, **kwargs) for worker in self._workers]
         if _DISPATCH_DEBUG:
+            # 原因：广播路径容易和 sharded 路径混淆，日志保留 path 方便定位调度问题。
             logger.warning(
                 f"[execute_all_async] method={method_name} path=broadcast "
                 f"fired {len(refs)} RPCs on {length} workers "

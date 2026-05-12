@@ -46,9 +46,7 @@ def main(config):
     from omegaconf import OmegaConf
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
-    # RayResourcePool reserves `max_collocate_count` CPUs per GPU worker bundle.
-    # main_generation launches one rollout worker per visible GPU, so ensure the
-    # local Ray instance exposes enough CPU resources for placement groups.
+    # 原因：Ray placement group 会为每个 GPU worker 预留 CPU，显式给足避免本地评测卡调度。
     required_cpus = max(8 * config.trainer.nnodes, 5 * config.trainer.n_gpus_per_node * config.trainer.nnodes)
     ray.init(num_gpus=config.trainer.n_gpus_per_node * config.trainer.nnodes,
              num_cpus=required_cpus,
@@ -65,7 +63,14 @@ def main(config):
     item_ids = dataset[config.data.prompt_key].tolist()
     # load sub category test file
     category_files = os.listdir(config.data.path)
-    category_files = [f for f in category_files if not f.startswith(f"{config.agentgym.task_name}_test")]
+    # 注意：只读取子任务 json，避免目录或主测试文件混进 category_map。
+    category_files = [
+        f
+        for f in category_files
+        if not f.startswith(f"{config.agentgym.task_name}_test")
+        and f.endswith(".json")
+        and os.path.isfile(os.path.join(config.data.path, f))
+    ]
     category_map = {}
     for category_file in category_files:
         path = os.path.join(config.data.path, category_file)
@@ -100,9 +105,7 @@ def main(config):
             batch_item_ids = item_ids[start_idx: end_idx]
             single_messages = [{"role": "user", "content": env_client.conversation_start[0]["value"]},
                                {"role": "assistant", "content": env_client.conversation_start[1]["value"]}]
-            # Keep evaluation prompts aligned with RL training prompts. The rollout
-            # handler expects the Qwen-style prompt to end exactly at `<|im_end|>`
-            # after the assistant bootstrap message.
+            # 原因：评测 prompt 与训练入口保持同一 Qwen chat 模板，避免离线评测和训练 rollout 偏移。
             single_prompt = (
                 "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
                 f"<|im_start|>user\n{env_client.conversation_start[0]['value']}<|im_end|>\n"
@@ -174,6 +177,7 @@ def main(config):
                 env_client.close()
             except Exception as e:
                 print(f"Error during closing eval env client: {e}")
+        # 原因：脚本式评测多次启动，结束时关闭 Ray，避免残留 worker 占端口和 GPU。
         ray.shutdown()
 
 

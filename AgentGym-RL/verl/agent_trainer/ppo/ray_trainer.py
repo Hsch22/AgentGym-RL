@@ -81,6 +81,7 @@ class ResourcePoolManager:
 
 import torch
 from verl.utils.torch_functional import masked_mean
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
 
 def find_latest_ckpt_path_aistudio(path, directory_format="global_step_{}"):
@@ -135,6 +136,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+    # === LOCAL CHANGE：接收 MClaw 已生成的 advantages/returns ===
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == 'gae':
@@ -187,9 +189,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == 'mclaw':
-        # MClaw computes tree-based advantages during rollout.
-        # They are already embedded in the DataProto by DataProtoAdapter.
-        # Just ensure returns exist (use advantages as fallback).
+        # MClaw 在树搜索 rollout 内生成 advantage，这里只校验并补齐 returns。
         if 'advantages' not in data.batch.keys():
             raise ValueError("MClaw rollout must populate advantages in DataProto")
         if 'returns' not in data.batch.keys():
@@ -257,6 +257,82 @@ def reduce_metrics(metrics: dict):
     for key, val in metrics.items():
         metrics[key] = np.mean(val)
     return metrics
+
+
+ROLLOUT_MONITOR_KEY = "rollout_monitor"
+
+
+def _safe_ratio(numerator, denominator):
+    # === LOCAL CHANGE：rollout 有效性指标的安全除法辅助函数。 ===
+    return float(numerator) / float(denominator) if denominator else 0.0
+
+
+def _collect_rollout_monitor_totals(data: DataProto):
+    # === LOCAL CHANGE：聚合非张量形式的 rollout monitor 记录。 ===
+    # rollout monitor 是非张量 batch，需在 driver 侧汇总后再进日志系统。
+    records = data.non_tensor_batch.get(ROLLOUT_MONITOR_KEY)
+    totals = {}
+    if records is None:
+        return totals
+    for record in records.reshape(-1):
+        if not isinstance(record, dict):
+            continue
+        for key, value in record.items():
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                if key.endswith("_max"):
+                    totals[key] = max(totals.get(key, 0.0), float(value))
+                else:
+                    totals[key] = totals.get(key, 0.0) + float(value)
+    return totals
+
+
+def compute_rollout_monitor_metrics(data: DataProto, prefix="rollout"):
+    # === LOCAL CHANGE：将 rollout monitor 计数转换为日志指标。 ===
+    totals = _collect_rollout_monitor_totals(data)
+    if not totals:
+        return {}
+
+    metrics = {}
+
+    def add_bucket(metric_prefix, source_prefix=""):
+        candidate_total = totals.get(f"{source_prefix}candidate_total", 0.0)
+        candidate_string_valid = totals.get(f"{source_prefix}candidate_string_valid", 0.0)
+        taken_total = totals.get(f"{source_prefix}taken_total", 0.0)
+        taken_string_valid = totals.get(f"{source_prefix}taken_string_valid", 0.0)
+        taken_env_valid = totals.get(f"{source_prefix}taken_env_valid", 0.0)
+        string_valid_env_invalid = totals.get(f"{source_prefix}string_valid_env_invalid", 0.0)
+        raw_chars_sum = totals.get(f"{source_prefix}taken_action_raw_chars_sum", 0.0)
+        raw_chars_max = totals.get(f"{source_prefix}taken_action_raw_chars_max", 0.0)
+        norm_chars_sum = totals.get(f"{source_prefix}taken_action_norm_chars_sum", 0.0)
+        norm_chars_max = totals.get(f"{source_prefix}taken_action_norm_chars_max", 0.0)
+
+        metrics.update({
+            f"{metric_prefix}/candidate_total_count": candidate_total,
+            f"{metric_prefix}/candidate_string_valid_count": candidate_string_valid,
+            f"{metric_prefix}/candidate_string_valid_ratio": _safe_ratio(candidate_string_valid, candidate_total),
+            f"{metric_prefix}/taken_total_count": taken_total,
+            f"{metric_prefix}/taken_string_valid_count": taken_string_valid,
+            f"{metric_prefix}/taken_env_valid_count": taken_env_valid,
+            f"{metric_prefix}/string_valid_env_invalid_count": string_valid_env_invalid,
+            f"{metric_prefix}/taken_string_valid_ratio": _safe_ratio(taken_string_valid, taken_total),
+            f"{metric_prefix}/taken_env_valid_ratio": _safe_ratio(taken_env_valid, taken_total),
+            f"{metric_prefix}/string_valid_env_invalid_ratio": _safe_ratio(string_valid_env_invalid, taken_total),
+            f"{metric_prefix}/taken_action_raw_chars_mean": _safe_ratio(raw_chars_sum, taken_total),
+            f"{metric_prefix}/taken_action_raw_chars_max": raw_chars_max,
+            f"{metric_prefix}/taken_action_norm_chars_mean": _safe_ratio(norm_chars_sum, taken_total),
+            f"{metric_prefix}/taken_action_norm_chars_max": norm_chars_max,
+        })
+
+    add_bucket(prefix)
+    add_bucket(f"{prefix}/round0", "round0_")
+    add_bucket(f"{prefix}/later", "later_")
+    return metrics
+
+
+def drop_rollout_monitor(data: DataProto):
+    # === LOCAL CHANGE：在 PPO batch 处理前移除 monitor 负载。 ===
+    # monitor 只用于指标统计，删除后避免进入 PPO batch 分片和 actor update。
+    data.non_tensor_batch.pop(ROLLOUT_MONITOR_KEY, None)
 
 
 def compute_data_metrics(batch, use_critic=True):
@@ -517,6 +593,7 @@ class RayPPOTrainer(object):
         print("[validate_config] All configuration checks passed successfully!")
 
     def _create_dataloader(self):
+        # === LOCAL CHANGE：可选构造固定 eval batch （训练初始化时缓存的一批 prompt），用于 rollout 评估。 ===
         from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
         # TODO: we have to make sure the batch size is divisible by the dp size
         self.train_dataset = RLHFDataset(
@@ -542,6 +619,36 @@ class RayPPOTrainer(object):
         assert len(self.train_dataloader) >= 1
 
         print(f'Size of train dataloader: {len(self.train_dataloader)}')
+
+        self.val_dataloader = None
+        self.val_fixed_batches = []
+        val_files = self.config.data.get('val_files', None)
+        test_freq = int(self.config.trainer.get('test_freq', -1))
+        test_batches = int(self.config.trainer.get('test_batches', 1))
+        if test_freq > 0 and val_files and test_batches > 0:
+            # 固定 eval batch，训练中每次 test_freq 对比同一批任务，降低采样噪声。
+            self.val_dataset = RLHFDataset(
+                data_file=val_files,
+                tokenizer=self.tokenizer,
+                data_config=self.config.data,
+                agentgym_config=self.config.actor_rollout_ref.agentgym,
+            )
+            val_batch_size = self.config.data.val_batch_size or self.config.data.train_batch_size
+            val_sampler = SequentialSampler(data_source=self.val_dataset)
+            self.val_dataloader = DataLoader(dataset=self.val_dataset,
+                                             batch_size=val_batch_size,
+                                             drop_last=False,
+                                             collate_fn=collate_fn,
+                                             sampler=val_sampler)
+            for batch_idx, batch_dict in enumerate(self.val_dataloader):
+                if batch_idx >= test_batches:
+                    break
+                self.val_fixed_batches.append(batch_dict)
+            assert len(self.val_fixed_batches) >= 1
+            print(
+                f'Size of val dataloader: {len(self.val_dataloader)}; '
+                f'fixed eval batches: {len(self.val_fixed_batches)}'
+            )
 
         # inject total_training_steps to actor/critic optim_config. This is hacky.
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -742,12 +849,63 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _run_eval_rollout(self):
+        # === LOCAL CHANGE：使用当前 rollout 策略运行固定验证 prompt。 ===
+        if not getattr(self, "val_fixed_batches", None):
+            return {}
+
+        metrics = {}
+        rollout_n = self.config.actor_rollout_ref.rollout.n
+        world_size = self.actor_rollout_wg.world_size
+        for batch_idx, batch_dict in enumerate(self.val_fixed_batches):
+            timing_raw = {}
+            batch: DataProto = DataProto.from_single_dict(batch_dict)
+            gen_batch = batch.pop(
+                batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                non_tensor_batch_keys=['item_id', 'raw_prompt'],
+            )
+            valid_prompt_count = len(gen_batch)
+            # 原因：Ray DP dispatch 要求 batch 可整除 world_size；dummy 样本 rollout 后再裁掉。
+            gen_batch, pad_size = pad_dataproto_to_divisor(gen_batch, world_size)
+            dummy_flags = [False] * valid_prompt_count + [True] * pad_size
+            gen_batch.non_tensor_batch['rollout_is_dummy'] = np.array(dummy_flags, dtype=object)
+            gen_batch.meta_info['global_steps'] = f"eval_global{self.global_steps}_batch{batch_idx}"
+            gen_batch.meta_info['max_rounds'] = self.rounds_scheduler.get_rounds()
+
+            with _timer('eval_gen', timing_raw):
+                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+
+            if pad_size:
+                gen_batch_output = unpad_dataproto(gen_batch_output, pad_size * rollout_n)
+
+            batch_prefix = "eval" if len(self.val_fixed_batches) == 1 else f"eval/batch{batch_idx}"
+            metrics.update(compute_rollout_monitor_metrics(gen_batch_output, prefix=batch_prefix))
+            drop_rollout_monitor(gen_batch_output)
+
+            task_scores = gen_batch_output.batch["task_scores"].sum(-1)
+            task_rounds = gen_batch_output.batch["task_rounds"]
+            response_length = gen_batch_output.batch["response_mask"].sum(-1).float()
+            metrics.update({
+                f"{batch_prefix}/task_score/mean": torch.mean(task_scores).detach().item(),
+                f"{batch_prefix}/task_score/max": torch.max(task_scores).detach().item(),
+                f"{batch_prefix}/task_score/min": torch.min(task_scores).detach().item(),
+                f"{batch_prefix}/task_round/mean": torch.mean(task_rounds).detach().item(),
+                f"{batch_prefix}/task_round/max": torch.max(task_rounds).detach().item(),
+                f"{batch_prefix}/task_round/min": torch.min(task_rounds).detach().item(),
+                f"{batch_prefix}/response_length/mean": torch.mean(response_length).detach().item(),
+                f"{batch_prefix}/response_length/max": torch.max(response_length).detach().item(),
+                f"{batch_prefix}/response_length/min": torch.min(response_length).detach().item(),
+                f"{batch_prefix}/timing_s/gen": timing_raw.get('eval_gen', 0.0),
+            })
+        return metrics
+
     def fit(self):
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        # === LOCAL CHANGE：记录 rollout 有效性指标并周期性执行 eval rollout。 ===
         from verl.utils.tracking import Tracking
         from omegaconf import OmegaConf
 
@@ -808,6 +966,9 @@ class RayPPOTrainer(object):
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    # 原因：动作格式/环境有效率只用于观测 rollout 质量，不参与 advantage 计算。
+                    metrics.update(compute_rollout_monitor_metrics(batch, prefix="rollout"))
+                    drop_rollout_monitor(batch)
 
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
@@ -881,6 +1042,12 @@ class RayPPOTrainer(object):
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+
+                if self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0:
+                    # 注意：eval 走固定 batch 和当前 rollout 配置，不保存训练梯度。
+                    eval_metrics = self._run_eval_rollout()
+                    if eval_metrics:
+                        logger.log(data=eval_metrics, step=self.global_steps)
 
                 self.global_steps += 1
                 self.rounds_scheduler.step()

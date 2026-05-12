@@ -22,8 +22,8 @@ from verl.protocol import DataProtoFuture
 
 logger = logging.getLogger(__name__)
 
-# Gate verbose dispatch logging behind an env var so it doesn't spam unless asked.
-_DISPATCH_DEBUG = os.environ.get("VERL_DISPATCH_DEBUG", "1") not in ("", "0", "false", "False")
+# 注意：dispatch 调试日志通过环境变量控制，默认关闭以免训练日志被 RPC 分片信息刷屏。
+_DISPATCH_DEBUG = os.environ.get("VERL_DISPATCH_DEBUG", "0") not in ("", "0", "false", "False")
 
 # here we add a magic number of avoid user-defined function already have this attribute
 MAGIC_ATTR = 'attrs_3141562937'
@@ -281,7 +281,7 @@ def dispatch_dp_compute_data_proto(worker_group, *args, **kwargs):
     assert isinstance(worker_group, WorkerGroup)
     splitted_args, splitted_kwargs = _split_args_kwargs_data_proto(worker_group.world_size, *args, **kwargs)
     if _DISPATCH_DEBUG:
-        # splitted_args is a list of per-arg chunk-lists; each chunk-list has world_size entries.
+        # 原因：记录每个 DataProto 被切成几片，便于定位 DP dispatch 数量不匹配。
         arg_chunks = [len(a) for a in splitted_args]
         kwarg_chunks = {k: len(v) for k, v in splitted_kwargs.items()}
         target_workers = len(getattr(worker_group, "workers", []) or [])
@@ -300,6 +300,7 @@ def dispatch_dp_compute_data_proto_with_func(worker_group, *args, **kwargs):
     splitted_args, splitted_kwargs = _split_args_kwargs_data_proto(worker_group.world_size, *args[1:], **kwargs)
     splitted_args_with_func = [[args[0]] * worker_group.world_size] + splitted_args
     if _DISPATCH_DEBUG:
+        # 原因：带函数的 dispatch 多一列广播函数，日志里单独暴露，方便查错。
         arg_chunks = [len(a) for a in splitted_args_with_func]
         kwarg_chunks = {k: len(v) for k, v in splitted_kwargs.items()}
         target_workers = len(getattr(worker_group, "workers", []) or [])
