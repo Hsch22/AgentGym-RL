@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Level 2 smoke test: minimal single-GPU run to validate clustering rollout.
-# Run from /share/project/husicheng/muhan/AgentGym-RL
 set -x
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 export VLLM_USE_MODELSCOPE=0
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ATTENTION_BACKEND=XFORMERS
@@ -10,11 +11,11 @@ export HYDRA_FULL_ERROR=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Use the uv venv python (skip conda activate)
-VENVPY=/share/project/husicheng/muhan/AgentGym-RL/.venv/bin/python
+VENVPY="${VENVPY:-${REPO_ROOT}/.venv/bin/python}"
 
 task_name="textcraft"
 
-cd AgentGym-RL
+cd "${REPO_ROOT}/AgentGym-RL"
 
 env_server_url="http://127.0.0.1:36005"
 

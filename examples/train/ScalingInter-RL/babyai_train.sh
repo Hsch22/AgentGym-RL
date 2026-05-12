@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -x
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 
@@ -21,8 +23,8 @@ export NCCL_DEBUG_SUBSYS=COLL
 export WANDB_MODE=offline
 
 task_name="babyai"
-VENVPY=/share/project/husicheng/muhan/AgentGym-RL/.venv/bin/python
-PROJECT_ROOT=/share/project/husicheng/muhan/AgentGym-RL/AgentGym-RL
+VENVPY="${VENVPY:-${REPO_ROOT}/.venv/bin/python}"
+PROJECT_ROOT="${PROJECT_ROOT:-${REPO_ROOT}/AgentGym-RL}"
 
 cd "${PROJECT_ROOT}"
 

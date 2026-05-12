@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -x
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+train_visible_devices="${SEARCHQA_TRAIN_CUDA_VISIBLE_DEVICES:-0,1,3,4,5,6,7}"
+export CUDA_VISIBLE_DEVICES="${train_visible_devices}"
+n_gpus_per_node="${SEARCHQA_N_GPUS_PER_NODE:-$(awk -F',' '{print NF}' <<< "${CUDA_VISIBLE_DEVICES}")}"
 
 # Local env server must bypass inherited proxies.
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
@@ -21,12 +25,12 @@ export NCCL_DEBUG_SUBSYS=COLL
 export WANDB_MODE=offline
 
 task_name="searchqa"
-VENVPY=/share/project/husicheng/muhan/AgentGym-RL/.venv/bin/python
-PROJECT_ROOT=/share/project/husicheng/muhan/AgentGym-RL/AgentGym-RL
+VENVPY="${VENVPY:-${REPO_ROOT}/.venv/bin/python}"
+PROJECT_ROOT="${PROJECT_ROOT:-${REPO_ROOT}/AgentGym-RL}"
 
 cd "${PROJECT_ROOT}"
 
-env_server_url="http://127.0.0.1:36015"
+env_server_url="${SEARCHQA_ENV_SERVER_URL:-http://127.0.0.1:36015}"
 
 # Use the locally available actor model so the script is runnable on this machine.
 pure_agent_model_name="Qwen2.5-3B-Instruct"
@@ -38,74 +42,94 @@ if [ ! -d "${shm_model_path}" ] || [ ! -f "${shm_model_path}/config.json" ]; the
 fi
 agent_model_path="${shm_model_path}"
 
-kl_coef=0.001
-policy_learning_rate=1e-6
-rollout_sample_num=4
-train_batch_size=32
-ppo_mini_batch_size=8
-ppo_micro_batch_size_per_gpu=1
-ppo_inner_epochs=2
-use_remove_padding=true
-rollout_max_model_len=32768
-ppo_max_token_len_per_gpu=16384
-entropy_chunk_size=256
+kl_coef="${SEARCHQA_KL_COEF:-0.001}"
+policy_learning_rate="${SEARCHQA_POLICY_LR:-1e-6}"
+rollout_sample_num="${SEARCHQA_ROLLOUT_SAMPLE_NUM:-4}"
+train_batch_size="${SEARCHQA_TRAIN_BATCH_SIZE:-21}"
+ppo_mini_batch_size="${SEARCHQA_PPO_MINI_BATCH_SIZE:-8}"
+ppo_micro_batch_size_per_gpu="${SEARCHQA_PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
+ppo_inner_epochs="${SEARCHQA_PPO_EPOCHS:-2}"
+use_remove_padding="${SEARCHQA_USE_REMOVE_PADDING:-true}"
+rollout_max_model_len="${SEARCHQA_ROLLOUT_MAX_MODEL_LEN:-32768}"
+ppo_max_token_len_per_gpu="${SEARCHQA_PPO_MAX_TOKEN_LEN_PER_GPU:-16384}"
+entropy_chunk_size="${SEARCHQA_ENTROPY_CHUNK_SIZE:-256}"
+max_prompt_length="${SEARCHQA_MAX_PROMPT_LENGTH:-1024}"
+max_response_length="${SEARCHQA_MAX_RESPONSE_LENGTH:-8192}"
+max_tokens="${SEARCHQA_MAX_TOKENS:-512}"
+rounds="${SEARCHQA_ROUNDS:-[5,8,10]}"
+steps_scaling_inter="${SEARCHQA_STEPS_SCALING_INTER:-100}"
 
-total_epoches=20
+total_epoches="${SEARCHQA_TOTAL_EPOCHS:-20}"
+save_freq="${SEARCHQA_SAVE_FREQ:-25}"
+total_training_steps="${SEARCHQA_TOTAL_TRAINING_STEPS:-}"
 
 model_save_dir="saves"
 mkdir -p "${model_save_dir}"
-exp_name="searchqa_scalinginter_baseline_3b_$(date +%Y%m%d_%H%M)"
+exp_name_prefix="${SEARCHQA_EXP_PREFIX:-searchqa_scalinginter_baseline_3b}"
+exp_name="${exp_name_prefix}_$(date +%Y%m%d_%H%M)"
 model_save_path="${model_save_dir}/${exp_name}"
 
 mkdir -p "${model_save_path}"
 
 echo "[baseline-run] task=${task_name} model=${pure_agent_model_name}"
-echo "[baseline-run] rounds=[5,8,10] train_batch_size=${train_batch_size} rollout_n=${rollout_sample_num}"
-echo "[baseline-run] max_prompt_length=1024 max_response_length=8192"
+echo "[baseline-run] train_gpus=${CUDA_VISIBLE_DEVICES} n_gpus_per_node=${n_gpus_per_node}"
+echo "[baseline-run] rounds=${rounds} train_batch_size=${train_batch_size} rollout_n=${rollout_sample_num}"
+echo "[baseline-run] max_prompt_length=${max_prompt_length} max_response_length=${max_response_length}"
 echo "[baseline-run] use_remove_padding=${use_remove_padding} entropy_chunk_size=${entropy_chunk_size}"
-echo "[baseline-run] gpu_memory_utilization=0.7 max_model_len=${rollout_max_model_len} ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu} tensor_model_parallel_size=1"
+echo "[baseline-run] gpu_memory_utilization=0.7 max_model_len=${rollout_max_model_len} ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu} max_tokens=${max_tokens} tensor_model_parallel_size=1"
 echo "[baseline-run] env_server_url=${env_server_url}"
+if [ -n "${total_training_steps}" ]; then
+  echo "[baseline-run] total_training_steps=${total_training_steps}"
+fi
 echo "[baseline-run] logs=${model_save_path}"
 
 export VERL_ENTROPY_CHUNK_SIZE=${entropy_chunk_size}
 
-"${VENVPY}" -m verl.agent_trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
-    algorithm.rounds_ctrl.type=scaling_inter_stepwise \
-    algorithm.rounds_ctrl.steps_scaling_inter=100 \
-    algorithm.rounds_ctrl.rounds=[5,8,10] \
-    data.train_file=AgentItemId/${task_name}_train.json \
-    data.train_batch_size=${train_batch_size} \
-    data.max_prompt_length=1024 \
-    data.max_response_length=8192 \
-    actor_rollout_ref.agentgym.task_name=${task_name} \
-    actor_rollout_ref.agentgym.env_addr=${env_server_url} \
-    actor_rollout_ref.agentgym.timeout=600 \
-    actor_rollout_ref.model.path=${agent_model_path} \
-    actor_rollout_ref.model.use_remove_padding=${use_remove_padding} \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
-    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
-    actor_rollout_ref.rollout.n=${rollout_sample_num} \
-    actor_rollout_ref.rollout.max_model_len=${rollout_max_model_len} \
-    actor_rollout_ref.rollout.max_tokens=512 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.actor.ppo_epochs=${ppo_inner_epochs} \
-    actor_rollout_ref.actor.optim.lr=${policy_learning_rate} \
-    actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size} \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} \
-    actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.rollout.rollout_log_dir=${model_save_path}/executer_logs \
-    algorithm.kl_ctrl.kl_coef=${kl_coef} \
-    trainer.default_local_dir=${model_save_path} \
-    trainer.project_name=agentgym-rl-baseline \
-    trainer.experiment_name=${exp_name} \
-    trainer.save_freq=25 \
-    trainer.total_epochs=${total_epoches} \
-    trainer.nnodes=1 \
-    trainer.n_gpus_per_node=8 \
-    "trainer.logger=[console,wandb]"
+cmd=(
+  "${VENVPY}" -m verl.agent_trainer.main_ppo
+  algorithm.adv_estimator=grpo
+  algorithm.rounds_ctrl.type=scaling_inter_stepwise
+  "algorithm.rounds_ctrl.steps_scaling_inter=${steps_scaling_inter}"
+  "algorithm.rounds_ctrl.rounds=${rounds}"
+  "data.train_file=AgentItemId/${task_name}_train.json"
+  "data.train_batch_size=${train_batch_size}"
+  "data.max_prompt_length=${max_prompt_length}"
+  "data.max_response_length=${max_response_length}"
+  "actor_rollout_ref.agentgym.task_name=${task_name}"
+  "actor_rollout_ref.agentgym.env_addr=${env_server_url}"
+  actor_rollout_ref.agentgym.timeout=600
+  "actor_rollout_ref.model.path=${agent_model_path}"
+  "actor_rollout_ref.model.use_remove_padding=${use_remove_padding}"
+  actor_rollout_ref.actor.use_kl_loss=True
+  "actor_rollout_ref.actor.kl_loss_coef=${kl_coef}"
+  actor_rollout_ref.actor.kl_loss_type=low_var_kl
+  "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}"
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.7
+  "actor_rollout_ref.rollout.n=${rollout_sample_num}"
+  "actor_rollout_ref.rollout.max_model_len=${rollout_max_model_len}"
+  "actor_rollout_ref.rollout.max_tokens=${max_tokens}"
+  actor_rollout_ref.rollout.tensor_model_parallel_size=1
+  "actor_rollout_ref.actor.ppo_epochs=${ppo_inner_epochs}"
+  "actor_rollout_ref.actor.optim.lr=${policy_learning_rate}"
+  "actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}"
+  "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu}"
+  actor_rollout_ref.actor.use_dynamic_bsz=True
+  "actor_rollout_ref.rollout.rollout_log_dir=${model_save_path}/executer_logs"
+  "algorithm.kl_ctrl.kl_coef=${kl_coef}"
+  "trainer.default_local_dir=${model_save_path}"
+  trainer.project_name=agentgym-rl-baseline
+  "trainer.experiment_name=${exp_name}"
+  "trainer.save_freq=${save_freq}"
+  "trainer.total_epochs=${total_epoches}"
+  trainer.nnodes=1
+  "trainer.n_gpus_per_node=${n_gpus_per_node}"
+  "trainer.logger=[console,wandb]"
+)
+
+if [ -n "${total_training_steps}" ]; then
+  cmd+=("trainer.total_training_steps=${total_training_steps}")
+fi
+
+"${cmd[@]}"
 status=$?
 exit $status
