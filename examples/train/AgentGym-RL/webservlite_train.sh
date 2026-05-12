@@ -60,8 +60,6 @@ data_max_prompt_length="${DATA_MAX_PROMPT_LENGTH:-700}"
 data_max_response_length="${DATA_MAX_RESPONSE_LENGTH:-512}"
 if [ -n "${USE_REMOVE_PADDING:-}" ]; then
     use_remove_padding="${USE_REMOVE_PADDING}"
-elif [ "${model_type}" = "qwen3" ]; then
-    use_remove_padding=0
 else
     use_remove_padding=1
 fi
