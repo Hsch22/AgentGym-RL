@@ -21,6 +21,7 @@ from typing import Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
@@ -149,6 +150,183 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
             return entropy, log_probs
+
+    def _get_output_embedding_weight(self):
+        module = self.actor_module.module if isinstance(self.actor_module, FSDP) else self.actor_module
+        output_embeddings = module.get_output_embeddings()
+        weight = output_embeddings.weight
+        if weight.ndim != 2:
+            raise RuntimeError(f"Expected 2-D output embedding weight, got shape={tuple(weight.shape)}")
+        return weight
+
+    def _accumulate_g2rl_features(
+        self,
+        *,
+        token_logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        sample_ids: torch.Tensor,
+        batch_size: int,
+        feature_topk: int,
+        token_chunk_size: int,
+    ) -> torch.Tensor:
+        lm_head_weight = self._get_output_embedding_weight().detach()
+        vocab_size, hidden_size = lm_head_weight.shape
+        feature_topk = min(max(1, int(feature_topk)), int(vocab_size))
+        token_chunk_size = max(1, int(token_chunk_size))
+
+        features = torch.zeros(batch_size, hidden_size, dtype=torch.float32, device=token_logits.device)
+        counts = torch.zeros(batch_size, dtype=torch.float32, device=token_logits.device)
+
+        if token_logits.numel() == 0:
+            return features
+
+        for start in range(0, token_logits.size(0), token_chunk_size):
+            end = min(start + token_chunk_size, token_logits.size(0))
+            logits_chunk = token_logits[start:end]
+            labels_chunk = target_ids[start:end]
+            sample_chunk = sample_ids[start:end]
+
+            top_values, top_indices = torch.topk(logits_chunk, k=feature_topk, dim=-1)
+            top_probs = F.softmax(top_values.float(), dim=-1).to(lm_head_weight.dtype)
+            top_weight = lm_head_weight.index_select(0, top_indices.reshape(-1)).view(
+                top_indices.size(0),
+                top_indices.size(1),
+                hidden_size,
+            )
+            expected_weight = torch.bmm(top_probs.unsqueeze(1), top_weight).squeeze(1).float()
+            realized_weight = lm_head_weight.index_select(0, labels_chunk).float()
+            token_feature = realized_weight - expected_weight
+
+            features.index_add_(0, sample_chunk, token_feature)
+            counts.index_add_(0, sample_chunk, torch.ones_like(sample_chunk, dtype=torch.float32))
+
+        features = features / counts.clamp_min(1.0).unsqueeze(-1)
+        return features
+
+    def _forward_g2rl_features_micro_batch(self, micro_batch, temperature, feature_topk, token_chunk_size):
+        response_length = micro_batch['responses'].size(-1)
+        response_mask = micro_batch['response_mask'].bool()
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            input_ids = micro_batch['input_ids']
+            batch_size, seqlen = input_ids.shape
+            attention_mask = micro_batch['attention_mask']
+            position_ids = micro_batch['position_ids']
+            responses = micro_batch['responses']
+
+            if not torch.any(response_mask):
+                hidden_size = self._get_output_embedding_weight().shape[1]
+                return torch.zeros(batch_size, hidden_size, dtype=torch.float32, device=input_ids.device)
+
+            sample_ids, response_offsets = torch.where(response_mask)
+            target_ids = responses[sample_ids, response_offsets].long()
+
+            if self.use_remove_padding:
+                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
+                position_ids_rmpad = index_first_axis(
+                    rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
+                    indices,
+                ).transpose(0, 1)
+
+                if self.use_ulysses_sp:
+                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad,
+                        position_ids_rmpad,
+                        sp_size=self.ulysses_sequence_parallel_size,
+                    )
+                else:
+                    pad_size = 0
+
+                output = self.actor_module(
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    use_cache=False,
+                )
+                logits_rmpad = output.logits.squeeze(0)
+                logits_rmpad.div_(temperature)
+
+                if self.use_ulysses_sp:
+                    logits_rmpad = gather_outpus_and_unpad(
+                        logits_rmpad,
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
+
+                prediction_start = seqlen - response_length - 1
+                prediction_cols = prediction_start + response_offsets
+                flat_prediction_positions = sample_ids * seqlen + prediction_cols
+                inverse_indices = torch.full(
+                    (batch_size * seqlen,),
+                    -1,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                inverse_indices[indices] = torch.arange(indices.numel(), device=input_ids.device)
+                row_indices = inverse_indices.index_select(0, flat_prediction_positions)
+                valid_rows = row_indices >= 0
+                token_logits = logits_rmpad.index_select(0, row_indices[valid_rows])
+                target_ids = target_ids[valid_rows]
+                sample_ids = sample_ids[valid_rows]
+            else:
+                output = self.actor_module(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                )
+                logits = output.logits
+                logits.div_(temperature)
+                logits = logits[:, -response_length - 1:-1, :]
+                token_logits = logits[response_mask]
+
+            return self._accumulate_g2rl_features(
+                token_logits=token_logits,
+                target_ids=target_ids,
+                sample_ids=sample_ids.long(),
+                batch_size=batch_size,
+                feature_topk=feature_topk,
+                token_chunk_size=token_chunk_size,
+            )
+
+    def compute_g2rl_features(self, data: DataProto) -> torch.Tensor:
+        self.actor_module.eval()
+
+        micro_batch_size = data.meta_info['micro_batch_size']
+        temperature = data.meta_info['temperature']
+        use_dynamic_bsz = data.meta_info['use_dynamic_bsz']
+        feature_topk = int(data.meta_info.get('g2rl_feature_topk', 256))
+        token_chunk_size = int(data.meta_info.get('g2rl_token_chunk_size', 256))
+
+        select_keys = ['responses', 'response_mask', 'input_ids', 'attention_mask', 'position_ids']
+        batch = data.select(batch_keys=select_keys).batch
+
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info['max_token_len'] * self.ulysses_sequence_parallel_size
+            micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+        else:
+            micro_batches = batch.split(micro_batch_size)
+
+        features_lst = []
+        for micro_batch in micro_batches:
+            with torch.no_grad():
+                features = self._forward_g2rl_features_micro_batch(
+                    micro_batch,
+                    temperature=temperature,
+                    feature_topk=feature_topk,
+                    token_chunk_size=token_chunk_size,
+                )
+            features_lst.append(features)
+        features = torch.concat(features_lst, dim=0)
+
+        if use_dynamic_bsz:
+            indices = list(itertools.chain.from_iterable(indices))
+            assert len(indices) == features.size(0), f"{len(indices)} vs. {features.size()}"
+            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long, device=features.device)
+            features = features[revert_indices]
+
+        return features
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None

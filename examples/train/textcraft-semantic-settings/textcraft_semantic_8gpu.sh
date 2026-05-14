@@ -79,6 +79,8 @@ round1_clusters=8          # must equal rollout_sample_num
 later_candidates=9
 later_clusters=1
 gradient_d_proj=512
+feature_topk=256
+feature_chunk_size=4
 gradient_model_path=${agent_model_path}
 
 model_save_dir="saves"
@@ -133,6 +135,8 @@ $VENVPY -m verl.agent_trainer.main_ppo \
     actor_rollout_ref.rollout.clustering.later_candidates=${later_candidates} \
     actor_rollout_ref.rollout.clustering.later_clusters=${later_clusters} \
     actor_rollout_ref.rollout.clustering.gradient_d_proj=${gradient_d_proj} \
+    actor_rollout_ref.rollout.clustering.feature_topk=${feature_topk} \
+    actor_rollout_ref.rollout.clustering.feature_chunk_size=${feature_chunk_size} \
     actor_rollout_ref.rollout.clustering.gradient_model_path=${gradient_model_path} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     trainer.default_local_dir=${model_save_path} \

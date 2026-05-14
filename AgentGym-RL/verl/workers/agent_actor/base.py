@@ -50,6 +50,10 @@ class BasePPOActor(ABC):
         """
         pass
 
+    def compute_g2rl_features(self, data: DataProto) -> torch.Tensor:
+        """Compute trajectory-level G2RL sensitivity features."""
+        raise NotImplementedError
+
     @abstractmethod
     def update_policy(self, data: DataProto) -> Dict:
         """Update the policy with an iterator of DataProto

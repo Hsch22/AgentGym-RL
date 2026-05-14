@@ -14,7 +14,7 @@ data:
 actor_rollout_ref:
   hybrid_engine: True
   model:
-    path: ~/models/deepseek-llm-7b-chat
+    path: /mnt/workspace/users/mws/husicheng/code/AgentGym-RL/models/Qwen2.5-3B-Instruct
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: True
@@ -99,13 +99,19 @@ actor_rollout_ref:
     rollout_log_dir: null # Directory for storing rollout trajectories.
     clustering:
       enabled: false                  # Toggle clustering-based action selection
-      method: gradient                # "gradient", "semantic", "random_valid", or "random_raw"
+      method: gradient                # "gradient", "gradient_multiview", "semantic", "random_valid", or "random_raw"
       round1_candidates: 64           # Candidates generated in round 0
       round1_clusters: 8              # Cluster centers kept as parallel trajectories
       later_candidates: 16            # Candidates generated per trajectory in later rounds
       later_clusters: 4               # Clusters per trajectory in later rounds
+      later_cluster_every: 1          # Cluster every N later rounds; 0 disables later-round clustering
+      later_cluster_start: 1          # First later round index eligible for clustering
+      later_cluster_until: -1         # Last eligible later round index; -1 means no explicit cap
+      later_cluster_horizon_min: 0.0  # Skip clustering when remaining-horizon ratio is below this value
       gradient_d_proj: 512            # CountSketch projection dim for gradient clustering
-      gradient_model_path: models/Qwen2.5-7B-Instruct  # Standalone HF model for gradient clustering (P2)
+      feature_topk: 256               # Top-k softmax approximation for gradient_multiview features
+      feature_chunk_size: 4           # HF forward chunk size for gradient_multiview features
+      gradient_model_path: /mnt/workspace/users/mws/husicheng/code/AgentGym-RL/models/Qwen2.5-3B-Instruct  # Standalone HF model for gradient/semantic clustering
   mclaw:
     tree_rollout:
       root_budget: 256       # Number of candidate actions sampled at root
@@ -140,7 +146,7 @@ critic:
     warmup_style: constant  # select from constant/cosine
     total_training_steps: -1  # must be override by program
   model:
-    path: ~/models/deepseek-llm-7b-chat
+    path: /mnt/workspace/users/mws/husicheng/code/AgentGym-RL/models/Qwen2.5-3B-Instruct
     tokenizer_path: ${actor_rollout_ref.model.path}
     override_config: { }
     external_lib: ${actor_rollout_ref.model.external_lib}
@@ -204,6 +210,15 @@ algorithm:
     type: fixed  # Strategy for controlling the maximum number of interaction turns
     rounds: 15  # Maximum number of allowed interaction turns.
     steps_scaling_inter: 100  # Frequency (in training steps) to increase the maximum number of turns when using `scaling_inter_stepwise`.
+  g2rl:
+    enabled: false             # Paper-style trajectory-level G2RL reward shaping before advantage computation
+    lambda_coef: 1.0           # Multiplicative novelty strength: shaped_signed = signed_reward * (1 + lambda * novelty)
+    reward_clip: 3.0           # Clip shaped signed reward to [-reward_clip, reward_clip]
+    zero_one_to_signed: true   # Map 0/1 task success to -1/+1 before shaping
+    normalize_novelty: true    # Min-max normalize novelty within each prompt group
+    feature_topk: 256          # Top-k softmax approximation for E_p[W]
+    token_chunk_size: 256      # Token chunk size for feature accumulation inside actor forward
+    eps: 1e-6
   kl_ctrl:
     type: fixed
     kl_coef: 0.001

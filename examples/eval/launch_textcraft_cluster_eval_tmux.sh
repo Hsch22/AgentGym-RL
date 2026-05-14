@@ -9,7 +9,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-${REPO_ROOT}/AgentGym-RL}"
 AGENTGYM_ROOT="${AGENTGYM_ROOT:-${REPO_ROOT}/AgentGym}"
 VENVPY="${VENVPY:-${REPO_ROOT}/.venv/bin/python}"
-TEXTCRAFT_SERVER_BIN="${TEXTCRAFT_SERVER_BIN:-${REPO_ROOT}/.venv/bin/textcraft}"
+TEXTCRAFT_SERVER_BIN="${TEXTCRAFT_SERVER_BIN:-${REPO_ROOT}/.venv-textcraft-server/bin/textcraft}"
 RUN_DIR="${RUN_DIR:-${PROJECT_ROOT}/saves/tc_sem_rmpad_chunked_l9c3_20260418_1336}"
 EVAL_DATA_DIR="${EVAL_DATA_DIR:-${PROJECT_ROOT}/AgentEval/textcraft/eval}"
 

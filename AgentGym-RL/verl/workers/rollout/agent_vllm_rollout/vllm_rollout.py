@@ -163,13 +163,26 @@ class vLLMRollout(BaseRollout):
             round1_clusters = int(getattr(self.clustering_config, "round1_clusters"))
             later_candidates = int(getattr(self.clustering_config, "later_candidates"))
             later_clusters = int(getattr(self.clustering_config, "later_clusters"))
-            if method not in ("gradient", "semantic", "random_valid", "random_raw"):
+            later_cluster_every = int(getattr(self.clustering_config, "later_cluster_every", 1))
+            later_cluster_start = int(getattr(self.clustering_config, "later_cluster_start", 1))
+            later_cluster_until = int(getattr(self.clustering_config, "later_cluster_until", -1))
+            later_cluster_horizon_min = float(getattr(self.clustering_config, "later_cluster_horizon_min", 0.0))
+            if method not in ("gradient", "gradient_multiview", "semantic", "random_valid", "random_raw"):
                 raise ValueError(f"unsupported clustering method: {method}")
             assert round1_candidates >= round1_clusters >= 1, (
                 f"invalid round0 clustering config: {round1_candidates=} {round1_clusters=}"
             )
             assert later_candidates >= later_clusters >= 1, (
                 f"invalid later-round clustering config: {later_candidates=} {later_clusters=}"
+            )
+            assert later_cluster_every >= 0, (
+                f"later_cluster_every must be >= 0, got {later_cluster_every}"
+            )
+            assert later_cluster_start >= 1, (
+                f"later_cluster_start is a later-round index and must be >= 1, got {later_cluster_start}"
+            )
+            assert 0.0 <= later_cluster_horizon_min <= 1.0, (
+                f"later_cluster_horizon_min must be in [0, 1], got {later_cluster_horizon_min}"
             )
             assert round1_clusters == int(self.config.n), (
                 f"round0 clustering must match rollout.n so each repeated trajectory gets one center: "
@@ -179,10 +192,14 @@ class vLLMRollout(BaseRollout):
                 "[clustering-config] "
                 f"method={method} "
                 f"round0={round1_candidates}/{round1_clusters} "
-                f"later={later_candidates}/{later_clusters}"
+                f"later={later_candidates}/{later_clusters} "
+                f"later_schedule=every:{later_cluster_every},start:{later_cluster_start},"
+                f"until:{later_cluster_until},horizon_min:{later_cluster_horizon_min} "
+                f"feature_topk={int(getattr(self.clustering_config, 'feature_topk', 256))} "
+                f"feature_chunk_size={int(getattr(self.clustering_config, 'feature_chunk_size', 4))}"
             )
-        # gradient/semantic 聚类需要独立 HF 模型，避免直接调 FSDP actor 时因 rank 提前结束卡住 all_gather。
-        if self.clustering_enabled and self.clustering_config.method in ("gradient", "semantic"):
+        # gradient/semantic/multiview 聚类需要独立 HF 模型，避免直接调 FSDP actor 时因 rank 提前结束卡住 all_gather。
+        if self.clustering_enabled and self.clustering_config.method in ("gradient", "gradient_multiview", "semantic"):
             from transformers import AutoModelForCausalLM
             gradient_model_path = self.clustering_config.gradient_model_path
             self._gradient_model = AutoModelForCausalLM.from_pretrained(
@@ -193,9 +210,10 @@ class vLLMRollout(BaseRollout):
             # 聚类模型常驻 CPU，避免和 vLLM KV cache、FSDP all-gather 同时占显存。
             self._gradient_model.cpu()
             self._gradient_model.eval()
-            # gradient 聚类要对参数反传，用显式 requires_grad 防误关。
+            # 只有旧 gradient CountSketch 聚类要对参数反传；multiview/semantic 都是 forward-only。
+            requires_grad = self.clustering_config.method == "gradient"
             for p in self._gradient_model.parameters():
-                p.requires_grad_(True)
+                p.requires_grad_(requires_grad)
 
 
     @contextmanager
@@ -218,7 +236,7 @@ class vLLMRollout(BaseRollout):
         # === LOCAL CHANGE：将 FSDP actor 权重同步到非 FSDP 聚类模型。 ===
         if not self.clustering_enabled:
             return
-        if self.clustering_config.method not in ("gradient", "semantic"):
+        if self.clustering_config.method not in ("gradient", "gradient_multiview", "semantic"):
             return
         if self._gradient_model is None:
             return
@@ -249,14 +267,44 @@ class vLLMRollout(BaseRollout):
     def _get_clustering_model(self):
         # === LOCAL CHANGE：集中处理聚类和随机基线的方法选择。 ===
         method = self.clustering_config.method
-        if method in ("gradient", "semantic"):
+        if method in ("gradient", "gradient_multiview", "semantic"):
             # 聚类前向不走 FSDP，避免不同轨迹早停导致 collective 调用不一致。
             return self._gradient_model
         if method in ("random_valid", "random_raw"):
             return None
         raise ValueError(f"Unknown clustering method: {method}")
 
-    def _select_response_indices(self, model, obs_token_ids, response_texts, k):
+    def _should_cluster_later_round(self, round_idx, max_rounds):
+        """Return whether a later environment round should use expensive candidate clustering."""
+        every = int(getattr(self.clustering_config, "later_cluster_every", 1))
+        if every <= 0:
+            return False
+
+        start = int(getattr(self.clustering_config, "later_cluster_start", 1))
+        until = int(getattr(self.clustering_config, "later_cluster_until", -1))
+        if round_idx < start:
+            return False
+        if until >= 0 and round_idx > until:
+            return False
+        if (round_idx - start) % every != 0:
+            return False
+
+        horizon_min = float(getattr(self.clustering_config, "later_cluster_horizon_min", 0.0))
+        horizon_ratio = (max_rounds - round_idx - 1) / max(max_rounds - 1, 1)
+        return horizon_ratio >= horizon_min
+
+    def _select_response_indices(
+        self,
+        model,
+        obs_token_ids,
+        response_texts,
+        k,
+        *,
+        round_idx=0,
+        max_rounds=1,
+        temperature=None,
+        selection_stats=None,
+    ):
         """Select candidate indices according to the configured rollout method."""
         # === LOCAL CHANGE：按 gradient/semantic/random 策略选择候选中心。 ===
         method = self.clustering_config.method
@@ -282,6 +330,26 @@ class vLLMRollout(BaseRollout):
                 response_texts=response_texts,
                 k=k,
             )
+        if method == "gradient_multiview":
+            with torch.no_grad():
+                return _clustering.select_centers(
+                    method="gradient_multiview",
+                    model=model,
+                    tokenizer=self.tokenizer,
+                    obs_token_ids=obs_token_ids,
+                    response_texts=response_texts,
+                    k=k,
+                    round_idx=round_idx,
+                    max_rounds=max_rounds,
+                    temperature=float(
+                        self.config.get("temperature", 1.0)
+                        if temperature is None
+                        else temperature
+                    ),
+                    feature_topk=int(getattr(self.clustering_config, "feature_topk", 256)),
+                    feature_chunk_size=int(getattr(self.clustering_config, "feature_chunk_size", 4)),
+                    stats=selection_stats,
+                )
         raise ValueError(f"Unknown clustering method: {method}")
 
     @staticmethod
@@ -324,6 +392,30 @@ class vLLMRollout(BaseRollout):
         self._monitor_add(monitor, "candidate_total", total, round_idx)
         self._monitor_add(monitor, "candidate_string_valid", valid_count, round_idx)
         return valid_count
+
+    def _record_selection_monitor(self, monitor, round_idx, selected_texts, selection_stats=None):
+        # === LOCAL CHANGE：统计候选中心里同 normalized Action 的重复与 tokenizer fallback。 ===
+        normalized_actions = [
+            action
+            for action in (_clustering.parse_valid_action(text) for text in selected_texts)
+            if action is not None
+        ]
+        duplicate_count = len(normalized_actions) - len(set(normalized_actions))
+        self._monitor_add(monitor, "selected_total", len(selected_texts), round_idx)
+        self._monitor_add(monitor, "selected_duplicate_action", duplicate_count, round_idx)
+        if selection_stats:
+            self._monitor_add(
+                monitor,
+                "offset_fallback_count",
+                int(selection_stats.get("offset_fallback_count", 0)),
+                round_idx,
+            )
+            self._monitor_add(
+                monitor,
+                "multiview_feature_candidates",
+                int(selection_stats.get("multiview_feature_candidates", 0)),
+                round_idx,
+            )
 
     def _record_taken_action(
         self,
@@ -405,11 +497,36 @@ class vLLMRollout(BaseRollout):
             "string_valid_env_invalid",
             start_counts["string_valid_env_invalid"],
         )
+        selected_total = self._monitor_delta(monitors, "selected_total", start_counts["selected_total"])
+        selected_duplicate_action = self._monitor_delta(
+            monitors,
+            "selected_duplicate_action",
+            start_counts["selected_duplicate_action"],
+        )
+        offset_fallback_count = self._monitor_delta(
+            monitors,
+            "offset_fallback_count",
+            start_counts["offset_fallback_count"],
+        )
+        later_clustered_action = self._monitor_delta(
+            monitors,
+            "later_clustered_action",
+            start_counts.get("later_clustered_action", 0),
+        )
+        later_skipped_action = self._monitor_delta(
+            monitors,
+            "later_skipped_action",
+            start_counts.get("later_skipped_action", 0),
+        )
         return (
             f"candidate_string_valid={cand_valid}/{cand_total} "
+            f"selected_duplicate_action={selected_duplicate_action}/{selected_total} "
             f"taken_string_valid={taken_string_valid}/{taken_total} "
             f"taken_env_valid={taken_env_valid}/{taken_total} "
-            f"string_valid_env_invalid={string_valid_env_invalid}"
+            f"string_valid_env_invalid={string_valid_env_invalid} "
+            f"offset_fallback={offset_fallback_count} "
+            f"later_clustered={later_clustered_action} "
+            f"later_skipped={later_skipped_action}"
         )
 
     def _round0_clustering(
@@ -418,6 +535,7 @@ class vLLMRollout(BaseRollout):
         env_clients,
         task_rounds,
         rounds,
+        max_rounds,
         kwargs_sp,
         rollout_monitors,
         action_records,
@@ -460,11 +578,16 @@ class vLLMRollout(BaseRollout):
             )
 
             if self.clustering_config.method == "random_raw":
+                selection_stats = {}
                 selected_idxs = self._select_response_indices(
                     model=clustering_model,
                     obs_token_ids=gen_prompt,
                     response_texts=all_response_texts,
                     k=n_clusters,
+                    round_idx=rounds,
+                    max_rounds=max_rounds,
+                    temperature=sp_kwargs.get("temperature", self.config.get("temperature", 1.0)),
+                    selection_stats=selection_stats,
                 )
                 if not selected_idxs:
                     selected_idxs = [0]
@@ -480,17 +603,29 @@ class vLLMRollout(BaseRollout):
                 # 候选全无效时仍走 env.step，让环境返回错误状态而不是中断 batch。
                 if len(valid_texts) == 0:
                     selected_responses = [(0, all_response_texts[0])]
+                    selection_stats = {}
                 else:
                     k_eff = min(n_clusters, len(valid_texts))
+                    selection_stats = {}
                     center_local_idxs = self._select_response_indices(
                         model=clustering_model,
                         obs_token_ids=gen_prompt,
                         response_texts=valid_texts,
                         k=k_eff,
+                        round_idx=rounds,
+                        max_rounds=max_rounds,
+                        temperature=sp_kwargs.get("temperature", self.config.get("temperature", 1.0)),
+                        selection_stats=selection_stats,
                     )
                     selected_responses = [
                         (valid_indices[i], valid_texts[i]) for i in center_local_idxs
                     ]
+            self._record_selection_monitor(
+                rollout_monitors[handler_idxs[0]],
+                rounds,
+                [text for _, text in selected_responses],
+                selection_stats,
+            )
 
             # 中心数少于重复轨迹时循环分配，保持 batch 形状与 rollout.n 一致。
             time.sleep(self.config.send_interval)
@@ -542,6 +677,7 @@ class vLLMRollout(BaseRollout):
         env_clients,
         task_rounds,
         rounds,
+        max_rounds,
         kwargs_sp,
         rollout_monitors,
         action_records,
@@ -556,6 +692,8 @@ class vLLMRollout(BaseRollout):
         not_done = [(idx, h) for idx, h in enumerate(rollout_handler_ls) if not h.done]
         if not not_done:
             return
+        for handler_idx, _ in not_done:
+            self._monitor_add(rollout_monitors[handler_idx], "later_clustered_action", 1, rounds)
 
         time.sleep(self.config.send_interval)
         for handler_idx, handler in not_done:
@@ -581,14 +719,25 @@ class vLLMRollout(BaseRollout):
             )
 
             if self.clustering_config.method == "random_raw":
+                selection_stats = {}
                 selected_idxs = self._select_response_indices(
                     model=clustering_model,
                     obs_token_ids=gen_prompt,
                     response_texts=all_response_texts,
                     k=n_clusters,
+                    round_idx=rounds,
+                    max_rounds=max_rounds,
+                    temperature=sp_kwargs.get("temperature", self.config.get("temperature", 1.0)),
+                    selection_stats=selection_stats,
                 )
                 if not selected_idxs:
                     selected_idxs = [0]
+                self._record_selection_monitor(
+                    rollout_monitors[handler_idx],
+                    rounds,
+                    [all_response_texts[i] for i in selected_idxs],
+                    selection_stats,
+                )
                 chosen_raw_idx = random.choice(selected_idxs)
                 chosen_text = all_response_texts[chosen_raw_idx]
             else:
@@ -602,13 +751,30 @@ class vLLMRollout(BaseRollout):
                     # 候选全无效时保留原始响应交给环境判错，避免丢失该轮轨迹。
                     chosen_raw_idx = 0
                     chosen_text = all_response_texts[0]
+                    self._record_selection_monitor(
+                        rollout_monitors[handler_idx],
+                        rounds,
+                        [chosen_text],
+                        {},
+                    )
                 else:
                     k_eff = min(n_clusters, len(valid_texts))
+                    selection_stats = {}
                     center_local_idxs = self._select_response_indices(
                         model=clustering_model,
                         obs_token_ids=gen_prompt,
                         response_texts=valid_texts,
                         k=k_eff,
+                        round_idx=rounds,
+                        max_rounds=max_rounds,
+                        temperature=sp_kwargs.get("temperature", self.config.get("temperature", 1.0)),
+                        selection_stats=selection_stats,
+                    )
+                    self._record_selection_monitor(
+                        rollout_monitors[handler_idx],
+                        rounds,
+                        [valid_texts[i] for i in center_local_idxs],
+                        selection_stats,
                     )
                     chosen_local = random.choice(center_local_idxs)
                     chosen_raw_idx = valid_indices[chosen_local]
@@ -754,55 +920,89 @@ class vLLMRollout(BaseRollout):
                 f"[rollout] rank={_rollout_rank} START batch_size={batch_size} max_rounds={max_rounds} t={_rollout_wall_start:.1f}",
                 file=sys.stderr, flush=True,
             )
-            def agent_step(i, idx):
-                content = self.tokenizer.decode(response_ids[i], skip_special_tokens=True)
-                candidate_string_valid_count = self._record_candidate_monitor(
-                    rollout_monitors[idx],
-                    rounds,
-                    [content],
+            def standard_round_step(record_later_skip=False):
+                generation_prompt_idxs = []
+                not_done_idxs = []
+                for idx, rollout_handler in enumerate(rollout_handler_ls):
+                    if not rollout_handler.done:
+                        generation_prompt_idxs.append(rollout_handler.get_generation_prompt(self.tokenizer))
+                        not_done_idxs.append(idx)
+
+                if record_later_skip:
+                    for idx in not_done_idxs:
+                        self._monitor_add(rollout_monitors[idx], "later_skipped_action", 1, rounds)
+
+                rollout_bar.set_description(
+                    f"Rounds {rounds + 1}/{max_rounds} | Active agents per gpu: {len(not_done_idxs)}"
                 )
-                rollout_handler_ls[idx].add_assistant_message(self.tokenizer, content)
-                task_rounds[idx] += 1
-                try:
-                    step_output = env_clients[idx].step(content)
-                    self._record_taken_action(
-                        rollout_monitor=rollout_monitors[idx],
-                        action_records=action_records,
-                        action_records_lock=action_records_lock,
-                        rollout_handler=rollout_handler_ls[idx],
-                        trajectory_index=idx,
-                        round_idx=rounds,
-                        raw_response=content,
-                        raw_candidate_index=0,
-                        candidate_count=1,
-                        candidate_string_valid_count=candidate_string_valid_count,
-                        step_output=step_output,
-                    )
-                    state, rollout_handler_ls[idx].score, rollout_handler_ls[idx].done = (
-                        step_output.state,
-                        step_output.reward,
-                        step_output.done,
-                    )
-                    rollout_handler_ls[idx].add_user_message(self.tokenizer, state)
-                    return step_output.done
-                except Exception as e:
-                    self._record_taken_action(
-                        rollout_monitor=rollout_monitors[idx],
-                        action_records=action_records,
-                        action_records_lock=action_records_lock,
-                        rollout_handler=rollout_handler_ls[idx],
-                        trajectory_index=idx,
-                        round_idx=rounds,
-                        raw_response=content,
-                        raw_candidate_index=0,
-                        candidate_count=1,
-                        candidate_string_valid_count=candidate_string_valid_count,
-                        error=e,
-                    )
-                    rollout_handler_ls[idx].score = 0
-                    rollout_handler_ls[idx].done = True
-                    print(f"Rollou step Error: {e} item id = {rollout_handler_ls[idx].item_id}")
+                if len(not_done_idxs) == 0:
                     return True
+
+                with self.update_sampling_params(**kwargs):
+                    output = self.inference_engine.generate(
+                        prompts=None,
+                        prompt_token_ids=generation_prompt_idxs,
+                        sampling_params=self.sampling_params,
+                        use_tqdm=False)
+                response_ids_local = output[0].tolist()
+
+                def direct_agent_step(i, idx):
+                    content = self.tokenizer.decode(response_ids_local[i], skip_special_tokens=True)
+                    candidate_string_valid_count = self._record_candidate_monitor(
+                        rollout_monitors[idx],
+                        rounds,
+                        [content],
+                    )
+                    rollout_handler_ls[idx].add_assistant_message(self.tokenizer, content)
+                    task_rounds[idx] += 1
+                    try:
+                        step_output = env_clients[idx].step(content)
+                        self._record_taken_action(
+                            rollout_monitor=rollout_monitors[idx],
+                            action_records=action_records,
+                            action_records_lock=action_records_lock,
+                            rollout_handler=rollout_handler_ls[idx],
+                            trajectory_index=idx,
+                            round_idx=rounds,
+                            raw_response=content,
+                            raw_candidate_index=0,
+                            candidate_count=1,
+                            candidate_string_valid_count=candidate_string_valid_count,
+                            step_output=step_output,
+                        )
+                        state, rollout_handler_ls[idx].score, rollout_handler_ls[idx].done = (
+                            step_output.state,
+                            step_output.reward,
+                            step_output.done,
+                        )
+                        rollout_handler_ls[idx].add_user_message(self.tokenizer, state)
+                        return step_output.done
+                    except Exception as e:
+                        self._record_taken_action(
+                            rollout_monitor=rollout_monitors[idx],
+                            action_records=action_records,
+                            action_records_lock=action_records_lock,
+                            rollout_handler=rollout_handler_ls[idx],
+                            trajectory_index=idx,
+                            round_idx=rounds,
+                            raw_response=content,
+                            raw_candidate_index=0,
+                            candidate_count=1,
+                            candidate_string_valid_count=candidate_string_valid_count,
+                            error=e,
+                        )
+                        rollout_handler_ls[idx].score = 0
+                        rollout_handler_ls[idx].done = True
+                        print(f"Rollou step Error: {e} item id = {rollout_handler_ls[idx].item_id}")
+                        return True
+
+                time.sleep(self.config.send_interval)
+                with ThreadPoolExecutor(max_workers=len(not_done_idxs)) as executor:
+                    step_dones = list(executor.map(
+                        lambda args: direct_agent_step(*args), [(i, idx) for i, idx in enumerate(not_done_idxs)]
+                    ))
+                return all(step_dones)
+
             while rounds < max_rounds and not all_done_flag:
                 _round_start_done = sum(1 for h in rollout_handler_ls if h.done)
                 _round_start_active = batch_size - _round_start_done
@@ -813,6 +1013,11 @@ class vLLMRollout(BaseRollout):
                     "taken_string_valid": sum(m.get("taken_string_valid", 0) for m in rollout_monitors),
                     "taken_env_valid": sum(m.get("taken_env_valid", 0) for m in rollout_monitors),
                     "string_valid_env_invalid": sum(m.get("string_valid_env_invalid", 0) for m in rollout_monitors),
+                    "selected_total": sum(m.get("selected_total", 0) for m in rollout_monitors),
+                    "selected_duplicate_action": sum(m.get("selected_duplicate_action", 0) for m in rollout_monitors),
+                    "offset_fallback_count": sum(m.get("offset_fallback_count", 0) for m in rollout_monitors),
+                    "later_clustered_action": sum(m.get("later_clustered_action", 0) for m in rollout_monitors),
+                    "later_skipped_action": sum(m.get("later_skipped_action", 0) for m in rollout_monitors),
                 }
                 print(
                     f"[rollout] rank={_rollout_rank} round={rounds}/{max_rounds} "
@@ -829,6 +1034,7 @@ class vLLMRollout(BaseRollout):
                             env_clients,
                             task_rounds,
                             rounds,
+                            max_rounds,
                             kwargs,
                             rollout_monitors,
                             action_records,
@@ -836,44 +1042,38 @@ class vLLMRollout(BaseRollout):
                         )
                     else:
                         active_cnt = sum(1 for h in rollout_handler_ls if not h.done)
-                        rollout_bar.set_description(f"Rounds {rounds + 1}/{max_rounds} | Active {active_cnt}")
-                        self._later_round_clustering(
-                            rollout_handler_ls,
-                            env_clients,
-                            task_rounds,
-                            rounds,
-                            kwargs,
-                            rollout_monitors,
-                            action_records,
-                            action_records_lock,
-                        )
+                        if self._should_cluster_later_round(rounds, max_rounds):
+                            rollout_bar.set_description(f"Rounds {rounds + 1}/{max_rounds} | Active {active_cnt}")
+                            self._later_round_clustering(
+                                rollout_handler_ls,
+                                env_clients,
+                                task_rounds,
+                                rounds,
+                                max_rounds,
+                                kwargs,
+                                rollout_monitors,
+                                action_records,
+                                action_records_lock,
+                            )
+                        else:
+                            rollout_bar.set_description(
+                                f"Rounds {rounds + 1}/{max_rounds} | Active {active_cnt} | Direct"
+                            )
+                            all_done_flag = standard_round_step(record_later_skip=True)
+                            rounds += 1
+                            rollout_bar.update(1)
+                            print(
+                                f"[rollout] rank={_rollout_rank} round={rounds - 1} "
+                                f"done_in_round={sum(1 for h in rollout_handler_ls if h.done) - _round_start_done} "
+                                f"total_done={sum(1 for h in rollout_handler_ls if h.done)}/{batch_size} "
+                                f"{self._round_valid_summary(rollout_monitors, _round_start_counts)} "
+                                f"t={time.time():.1f}",
+                                file=sys.stderr, flush=True,
+                            )
+                            continue
                     all_done_flag = all(h.done for h in rollout_handler_ls)
                 else:
-                    # get generation prompt
-                    generation_prompt_idxs = []
-                    not_done_idxs = []
-                    for idx, rollout_handler in enumerate(rollout_handler_ls):
-                        if not rollout_handler.done:
-                            generation_prompt_idxs.append(rollout_handler.get_generation_prompt(self.tokenizer))
-                            not_done_idxs.append(idx)
-
-                    rollout_bar.set_description(f"Rounds {rounds + 1}/{max_rounds} | Active agents per gpu: {len(not_done_idxs)}")
-                    # users can customize different sampling_params at different run
-                    with self.update_sampling_params(**kwargs):
-                        output = self.inference_engine.generate(
-                            prompts=None,
-                            prompt_token_ids=generation_prompt_idxs,
-                            sampling_params=self.sampling_params,
-                            use_tqdm=False)
-                    response_ids = output[0].tolist()
-                    all_done_flag = True
-                    time.sleep(self.config.send_interval) # take a break before sendng request
-                    if len(not_done_idxs) > 0:
-                        with ThreadPoolExecutor(max_workers=len(not_done_idxs)) as executor:
-                            step_dones = list(executor.map(
-                                lambda args: agent_step(*args), [(i, idx) for i, idx in enumerate(not_done_idxs)]
-                            ))
-                            all_done_flag = all(step_dones)
+                    all_done_flag = standard_round_step()
                 _round_end_done = sum(1 for h in rollout_handler_ls if h.done)
                 _newly_done = _round_end_done - _round_start_done
                 print(
