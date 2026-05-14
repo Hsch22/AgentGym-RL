@@ -111,11 +111,13 @@ class RLHFDataset(Dataset):
 
     def resume_dataset_state(self):
         self.serialize_dataset = not hasattr(self, "original_data_file")
+        self.close()
         # resume dataframe if not it's serialized in data.pt
         if not self.serialize_dataset:
             self._read_files_and_tokenize()
         else:
             print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
+        self.env_client = init_env_client(self.agentgym_config)
 
     def __len__(self):
         return len(self.dataframe)
@@ -159,14 +161,14 @@ class RLHFDataset(Dataset):
         return row_dict
 
     def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("env_client", None)
         if not self.serialize_dataset:
-            state = self.__dict__.copy()
-
             if "dataframe" in state:
                 del state["dataframe"]
             return state
 
-        return self.__dict__.copy()
+        return state
 
     def __del__(self):
         try:

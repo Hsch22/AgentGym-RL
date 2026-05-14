@@ -16,6 +16,15 @@ export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
 
 # Use the uv venv python (skip conda activate)
 VENVPY="${VENVPY:-${REPO_ROOT}/.venv/bin/python}"
+if [[ -n "${TEXTCRAFT_TMPDIR:-}" ]]; then
+    export TMPDIR="${TEXTCRAFT_TMPDIR}"
+else
+    mkdir -p "${REPO_ROOT}/.tmp"
+    ln -sfn "${REPO_ROOT}/.tmp" /tmp/agentgym_rl_tmp
+    export TMPDIR="/tmp/agentgym_rl_tmp"
+fi
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${REPO_ROOT}/.cache/triton}"
+mkdir -p "${TMPDIR}" "${TRITON_CACHE_DIR}"
 TEXTCRAFT_ENV_PORT="${TEXTCRAFT_ENV_PORT:-36005}"
 TEXTCRAFT_AUTO_START_ENV="${TEXTCRAFT_AUTO_START_ENV:-1}"
 
@@ -41,6 +50,9 @@ ppo_mini_batch_size=2
 ppo_micro_batch_size_per_gpu=1
 ppo_inner_epochs=1
 total_epoches=1
+total_training_steps="${TEXTCRAFT_TOTAL_TRAINING_STEPS:-1}"
+save_freq="${TEXTCRAFT_SAVE_FREQ:-1}"
+resume_mode="${TEXTCRAFT_RESUME_MODE:-disable}"
 
 # Clustering smoke params: semantic (no extra gradient model)
 clustering_enabled=true
@@ -98,7 +110,9 @@ $VENVPY -m verl.agent_trainer.main_ppo \
     trainer.default_local_dir=${model_save_path} \
     trainer.project_name=smoke \
     trainer.experiment_name=${exp_name} \
-    trainer.save_freq=-1 \
+    trainer.resume_mode=${resume_mode} \
+    trainer.save_freq=${save_freq} \
+    trainer.total_training_steps=${total_training_steps} \
     trainer.total_epochs=${total_epoches} \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=2 \

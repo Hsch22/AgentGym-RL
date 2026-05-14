@@ -17,11 +17,12 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import random
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Type, Dict
+from typing import Any, List, Optional, Type, Dict
 from copy import deepcopy
 
 import numpy as np
@@ -35,6 +36,11 @@ from verl.agent_trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.agent_dataset.rl_dataset import RLHFDataset, collate_fn
+from verl.utils.agent_dataset.resume_cursor import (
+    compute_steps_per_epoch,
+    cursor_from_completed_steps,
+    epoch_indices,
+)
 from abc import ABC, abstractmethod
 
 WorkerType = Type[Worker]
@@ -211,6 +217,14 @@ class RoundsScheduler(ABC):
     @abstractmethod
     def get_rounds(self):
         raise NotImplementedError
+
+    @abstractmethod
+    def state_dict(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_state_dict(self, state_dict):
+        raise NotImplementedError
     
 
 class FixedRoundsScheduler(RoundsScheduler):
@@ -225,6 +239,20 @@ class FixedRoundsScheduler(RoundsScheduler):
 
     def get_rounds(self):
         return self.max_rounds
+
+    def state_dict(self):
+        return {
+            'type': 'fixed',
+            'max_rounds': self.max_rounds,
+        }
+
+    def load_state_dict(self, state_dict):
+        if state_dict.get('type') != 'fixed':
+            raise ValueError(f"Cannot load rounds scheduler state with type={state_dict.get('type')} into fixed scheduler")
+        if int(state_dict['max_rounds']) != int(self.max_rounds):
+            raise ValueError(
+                f"Fixed rounds mismatch: checkpoint={state_dict['max_rounds']} current={self.max_rounds}"
+            )
 
 
 class StepRoundsScheduler(RoundsScheduler):
@@ -252,6 +280,33 @@ class StepRoundsScheduler(RoundsScheduler):
     def get_rounds(self):
         return self.max_rounds
 
+    def state_dict(self):
+        return {
+            'type': 'scaling_inter_stepwise',
+            'rounds_ls': list(self.rounds_ls),
+            'steps_scaling_inter': self.steps_scaling_inter,
+            'max_rounds': self.max_rounds,
+            'current_stage': self.current_stage,
+            'global_steps': self.global_steps,
+        }
+
+    def load_state_dict(self, state_dict):
+        if state_dict.get('type') != 'scaling_inter_stepwise':
+            raise ValueError(
+                f"Cannot load rounds scheduler state with type={state_dict.get('type')} "
+                "into scaling_inter_stepwise scheduler"
+            )
+        if list(state_dict['rounds_ls']) != list(self.rounds_ls):
+            raise ValueError(f"Rounds schedule mismatch: checkpoint={state_dict['rounds_ls']} current={self.rounds_ls}")
+        if int(state_dict['steps_scaling_inter']) != int(self.steps_scaling_inter):
+            raise ValueError(
+                "Rounds scheduler interval mismatch: "
+                f"checkpoint={state_dict['steps_scaling_inter']} current={self.steps_scaling_inter}"
+            )
+        self.global_steps = int(state_dict['global_steps'])
+        self.current_stage = int(state_dict['current_stage'])
+        self.max_rounds = int(state_dict['max_rounds'])
+
 
 def reduce_metrics(metrics: dict):
     for key, val in metrics.items():
@@ -260,6 +315,37 @@ def reduce_metrics(metrics: dict):
 
 
 ROLLOUT_MONITOR_KEY = "rollout_monitor"
+TRAINER_STATE_NAME = "trainer_state.pt"
+DATA_STATE_NAME = "data.pt"
+
+
+def _atomic_write_text(path: str, text: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    with open(tmp_path, 'w') as f:
+        f.write(text)
+    os.replace(tmp_path, path)
+
+
+def _atomic_torch_save(obj: Any, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _torch_load(path: str, **kwargs):
+    try:
+        return torch.load(path, weights_only=False, **kwargs)
+    except TypeError:
+        return torch.load(path, **kwargs)
+
+
+def _parse_global_step_from_path(global_step_folder: str) -> int:
+    folder_name = os.path.basename(os.path.normpath(global_step_folder))
+    if not folder_name.startswith('global_step_'):
+        raise ValueError(f"Checkpoint folder must be named global_step_N, got {global_step_folder}")
+    return int(folder_name.split('global_step_')[-1])
 
 
 def _safe_ratio(numerator, denominator):
@@ -619,6 +705,12 @@ class RayPPOTrainer(object):
         else:
             raise NotImplementedError
 
+        self.global_steps = 0
+        self.completed_steps = 0
+        self.epoch_idx = 0
+        self.batch_idx_in_epoch = 0
+        self._epoch_indices_cache: Optional[tuple[int, list[int]]] = None
+
         self._validate_config()
         self._create_dataloader()
 
@@ -698,7 +790,7 @@ class RayPPOTrainer(object):
 
     def _create_dataloader(self):
         # === LOCAL CHANGE：可选构造固定 eval batch （训练初始化时缓存的一批 prompt），用于 rollout 评估。 ===
-        from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+        from torch.utils.data import DataLoader, SequentialSampler
         # TODO: we have to make sure the batch size is divisible by the dp size
         self.train_dataset = RLHFDataset(
             data_file=self.config.data.train_file,
@@ -706,23 +798,17 @@ class RayPPOTrainer(object):
             data_config=self.config.data,
             agentgym_config=self.config.actor_rollout_ref.agentgym,
         )
-        # use sampler for better ckpt resume
-        if self.config.data.shuffle:
-            train_dataloader_generator = torch.Generator()
-            train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
-            sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
-        else:
-            sampler = SequentialSampler(data_source=self.train_dataset)
+        self.train_batch_size = int(self.config.data.train_batch_size)
+        self.data_seed = int(self.config.data.get('seed', 1))
+        self.train_dataset_len = len(self.train_dataset)
+        self.steps_per_epoch = compute_steps_per_epoch(
+            dataset_len=self.train_dataset_len,
+            batch_size=self.train_batch_size,
+            drop_last=True,
+        )
+        assert self.steps_per_epoch >= 1
 
-        self.train_dataloader = DataLoader(dataset=self.train_dataset,
-                                           batch_size=self.config.data.train_batch_size,
-                                           drop_last=True,
-                                           collate_fn=collate_fn,
-                                           sampler=sampler)
-
-        assert len(self.train_dataloader) >= 1
-
-        print(f'Size of train dataloader: {len(self.train_dataloader)}')
+        print(f'Size of train dataloader: {self.steps_per_epoch}')
 
         self.val_dataloader = None
         self.val_fixed_batches = []
@@ -755,12 +841,12 @@ class RayPPOTrainer(object):
             )
 
         # inject total_training_steps to actor/critic optim_config. This is hacky.
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        total_training_steps = self.steps_per_epoch * self.config.trainer.total_epochs
 
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
 
-        self.total_training_steps = total_training_steps
+        self.total_training_steps = int(total_training_steps)
         if self.config.algorithm.rounds_ctrl.type == 'fixed':
             self.rounds_scheduler = FixedRoundsScheduler(rounds=self.config.algorithm.rounds_ctrl.rounds)
         elif self.config.algorithm.rounds_ctrl.type == 'scaling_inter_stepwise':
@@ -772,8 +858,8 @@ class RayPPOTrainer(object):
 
         OmegaConf.set_struct(self.config, True)
         with open_dict(self.config):
-            self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
-            self.config.critic.optim.total_training_steps = total_training_steps
+            self.config.actor_rollout_ref.actor.optim.total_training_steps = self.total_training_steps
+            self.config.critic.optim.total_training_steps = self.total_training_steps
 
     def init_workers(self):
         """Init resource pool and worker group"""
@@ -831,7 +917,203 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
 
+    def _get_epoch_indices(self, epoch_idx: int) -> list[int]:
+        cached = self._epoch_indices_cache
+        if cached is not None and cached[0] == epoch_idx:
+            return cached[1]
+
+        indices = epoch_indices(
+            dataset_len=self.train_dataset_len,
+            epoch_idx=epoch_idx,
+            shuffle=bool(self.config.data.shuffle),
+            seed=self.data_seed,
+        )
+        self._epoch_indices_cache = (epoch_idx, indices)
+        return indices
+
+    def _get_train_batch_indices(self, epoch_idx: int, batch_idx_in_epoch: int) -> list[int]:
+        if batch_idx_in_epoch < 0 or batch_idx_in_epoch >= self.steps_per_epoch:
+            raise ValueError(
+                f"batch_idx_in_epoch must be in [0, {self.steps_per_epoch}), got {batch_idx_in_epoch}"
+            )
+        indices = self._get_epoch_indices(epoch_idx)
+        start = batch_idx_in_epoch * self.train_batch_size
+        end = start + self.train_batch_size
+        return indices[start:end]
+
+    def _get_train_batch(self) -> dict:
+        indices = self._get_train_batch_indices(self.epoch_idx, self.batch_idx_in_epoch)
+        return collate_fn([self.train_dataset[index] for index in indices])
+
+    def _set_cursor_from_completed_steps(self, completed_steps: int):
+        cursor = cursor_from_completed_steps(completed_steps, self.steps_per_epoch)
+        self.completed_steps = int(completed_steps)
+        self.global_steps = int(completed_steps)
+        self.epoch_idx = cursor.epoch_idx
+        self.batch_idx_in_epoch = cursor.batch_idx_in_epoch
+        self._epoch_indices_cache = None
+
+    def _advance_train_cursor(self):
+        self.batch_idx_in_epoch += 1
+        if self.batch_idx_in_epoch >= self.steps_per_epoch:
+            self.epoch_idx += 1
+            self.batch_idx_in_epoch = 0
+            self._epoch_indices_cache = None
+
+    def _driver_rng_state(self):
+        return {
+            'torch_cpu': torch.get_rng_state(),
+            'numpy': np.random.get_state(),
+            'random': random.getstate(),
+        }
+
+    def _load_driver_rng_state(self, rng_state):
+        if not rng_state:
+            return
+        torch.set_rng_state(rng_state['torch_cpu'])
+        np.random.set_state(rng_state['numpy'])
+        random.setstate(rng_state['random'])
+
+    def _actor_world_size(self) -> int:
+        return int(getattr(self.actor_rollout_wg, 'world_size'))
+
+    def _checkpoint_train_state(self):
+        return {
+            'version': 1,
+            'global_steps': int(self.global_steps),
+            'completed_steps': int(self.completed_steps),
+            'epoch_idx': int(self.epoch_idx),
+            'batch_idx_in_epoch': int(self.batch_idx_in_epoch),
+            'steps_per_epoch': int(self.steps_per_epoch),
+            'total_training_steps': int(self.total_training_steps),
+            'dataset_len': int(self.train_dataset_len),
+            'data_seed': int(self.data_seed),
+            'shuffle': bool(self.config.data.shuffle),
+            'train_batch_size': int(self.train_batch_size),
+            'rollout_n': int(self.config.actor_rollout_ref.rollout.n),
+            'world_size': int(self._actor_world_size()),
+            'rounds_scheduler': self.rounds_scheduler.state_dict(),
+            'driver_rng': self._driver_rng_state(),
+        }
+
+    def _checkpoint_data_state(self):
+        return {
+            'version': 1,
+            'dataset_len': int(self.train_dataset_len),
+            'data_file': str(self.config.data.train_file),
+            'completed_steps': int(self.completed_steps),
+            'epoch_idx': int(self.epoch_idx),
+            'batch_idx_in_epoch': int(self.batch_idx_in_epoch),
+            'steps_per_epoch': int(self.steps_per_epoch),
+            'data_seed': int(self.data_seed),
+            'shuffle': bool(self.config.data.shuffle),
+            'train_batch_size': int(self.train_batch_size),
+        }
+
+    def _require_checkpoint_file(self, path: str):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Incomplete checkpoint: missing {path}")
+
+    def _validate_worker_checkpoint_files(self, role_path: str, role_name: str):
+        if not os.path.isdir(role_path):
+            raise FileNotFoundError(f"Incomplete checkpoint: missing {role_name} directory {role_path}")
+        world_size = self._actor_world_size()
+        for rank in range(world_size):
+            for prefix in ('model', 'optim', 'extra_state'):
+                self._require_checkpoint_file(
+                    os.path.join(role_path, f'{prefix}_world_size_{world_size}_rank_{rank}.pt')
+                )
+
+    def _validate_checkpoint_files(self, global_step_folder: str):
+        tracker_path = os.path.join(os.path.dirname(global_step_folder), 'latest_checkpointed_iteration.txt')
+        if os.path.isfile(tracker_path):
+            with open(tracker_path, 'r') as f:
+                first_line = f.readline().strip()
+            if first_line:
+                int(first_line)
+        actor_path = os.path.join(global_step_folder, 'actor')
+        self._validate_worker_checkpoint_files(actor_path, 'actor')
+        if self.use_critic:
+            critic_path = os.path.join(global_step_folder, 'critic')
+            self._validate_worker_checkpoint_files(critic_path, 'critic')
+        self._require_checkpoint_file(os.path.join(global_step_folder, DATA_STATE_NAME))
+
+    def _validate_loaded_trainer_state(self, state: dict, global_step_folder: str):
+        expected_completed_steps = _parse_global_step_from_path(global_step_folder)
+        checks = {
+            'completed_steps': expected_completed_steps,
+            'global_steps': expected_completed_steps,
+            'steps_per_epoch': self.steps_per_epoch,
+            'total_training_steps': self.total_training_steps,
+            'dataset_len': self.train_dataset_len,
+            'data_seed': self.data_seed,
+            'shuffle': bool(self.config.data.shuffle),
+            'train_batch_size': self.train_batch_size,
+            'rollout_n': int(self.config.actor_rollout_ref.rollout.n),
+            'world_size': self._actor_world_size(),
+        }
+        for key, expected in checks.items():
+            actual = state.get(key)
+            if actual != expected:
+                raise ValueError(
+                    f"Cannot strictly resume {global_step_folder}: {key} mismatch "
+                    f"(checkpoint={actual}, current={expected})"
+                )
+
+        expected_cursor = cursor_from_completed_steps(expected_completed_steps, self.steps_per_epoch)
+        if int(state.get('epoch_idx', -1)) != expected_cursor.epoch_idx or \
+                int(state.get('batch_idx_in_epoch', -1)) != expected_cursor.batch_idx_in_epoch:
+            raise ValueError(
+                f"Cannot strictly resume {global_step_folder}: cursor mismatch "
+                f"(checkpoint epoch={state.get('epoch_idx')} batch={state.get('batch_idx_in_epoch')}, "
+                f"expected epoch={expected_cursor.epoch_idx} batch={expected_cursor.batch_idx_in_epoch})"
+            )
+        rounds_state = state.get('rounds_scheduler')
+        if not isinstance(rounds_state, dict):
+            raise ValueError(f"Cannot strictly resume {global_step_folder}: missing rounds_scheduler state")
+        if 'global_steps' in rounds_state and int(rounds_state['global_steps']) != expected_completed_steps + 1:
+            raise ValueError(
+                f"Cannot strictly resume {global_step_folder}: rounds scheduler next step mismatch "
+                f"(checkpoint={rounds_state['global_steps']}, expected={expected_completed_steps + 1})"
+            )
+
+    def _load_trainer_state_or_infer(self, global_step_folder: str):
+        trainer_state_path = os.path.join(global_step_folder, TRAINER_STATE_NAME)
+        if os.path.isfile(trainer_state_path):
+            state = _torch_load(trainer_state_path, map_location='cpu')
+            self._validate_loaded_trainer_state(state, global_step_folder)
+            self.completed_steps = int(state['completed_steps'])
+            self.global_steps = int(state['global_steps'])
+            self.epoch_idx = int(state['epoch_idx'])
+            self.batch_idx_in_epoch = int(state['batch_idx_in_epoch'])
+            self.rounds_scheduler.load_state_dict(state['rounds_scheduler'])
+            self._load_driver_rng_state(state.get('driver_rng'))
+            return state
+
+        try:
+            data_state = _torch_load(os.path.join(global_step_folder, DATA_STATE_NAME), map_location='cpu')
+        except Exception:
+            data_state = None
+        if isinstance(data_state, dict) and data_state.get('version') == 1:
+            raise FileNotFoundError(
+                f"Incomplete checkpoint: missing {trainer_state_path} next to new-format {DATA_STATE_NAME}"
+            )
+
+        completed_steps = _parse_global_step_from_path(global_step_folder)
+        self._set_cursor_from_completed_steps(completed_steps)
+        self.rounds_scheduler.set_global_steps(completed_steps + 1)
+        print(
+            f"Checkpoint {global_step_folder} has no {TRAINER_STATE_NAME}; "
+            f"inferring cursor from global_step_{completed_steps}."
+        )
+        return None
+
     def _save_checkpoint(self):
+        if int(self.global_steps) != int(self.completed_steps):
+            raise RuntimeError(
+                f"Refusing to save ambiguous checkpoint: global_steps={self.global_steps} "
+                f"completed_steps={self.completed_steps}"
+            )
         if self.config.trainer.storage_mode == 'aistudio':
             from aistudio_checkpoint.aistudio_mnt_checkpointer import AistudioMntCheckpointer
             ckpter = AistudioMntCheckpointer()
@@ -863,61 +1145,69 @@ class RayPPOTrainer(object):
                                            self.global_steps,
                                            remove_previous_ckpt=self.config.trainer.remove_previous_ckpt_in_save)
 
-        # save dataloader
-        dataloader_local_path = os.path.join(local_global_step_folder, 'data.pt')
-        import dill
-        torch.save(self.train_dataloader, dataloader_local_path, pickle_module=dill)
+        data_state_path = os.path.join(local_global_step_folder, DATA_STATE_NAME)
+        trainer_state_path = os.path.join(local_global_step_folder, TRAINER_STATE_NAME)
+        _atomic_torch_save(self._checkpoint_data_state(), data_state_path)
+        _atomic_torch_save(self._checkpoint_train_state(), trainer_state_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir,
                                                            'latest_checkpointed_iteration.txt')
-        with open(local_latest_checkpointed_iteration, 'w') as f:
-            if self.config.trainer.storage_mode == 'aistudio':
-                f.write(str(self.global_steps) + "\n" + ckpter.commit(memo=self.config.trainer.experiment_name))
-            elif self.config.trainer.storage_mode == 'local':
-                f.write(str(self.global_steps))
-            else:
-                raise NotImplementedError
+        if self.config.trainer.storage_mode == 'aistudio':
+            tracker_text = str(self.global_steps) + "\n" + ckpter.commit(memo=self.config.trainer.experiment_name)
+        elif self.config.trainer.storage_mode == 'local':
+            tracker_text = str(self.global_steps)
+        else:
+            raise NotImplementedError
+        _atomic_write_text(local_latest_checkpointed_iteration, tracker_text)
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == 'disable':
+            self._set_cursor_from_completed_steps(0)
+            self.rounds_scheduler.set_global_steps(1)
+            print('Training from scratch because trainer.resume_mode=disable')
             return 0
 
-        # load from hdfs
-        if self.config.trainer.default_hdfs_dir is not None:
-            NotImplementedError('load from hdfs is not implemented yet')
-        else:
-            checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
-            if not os.path.isabs(checkpoint_folder):
-                working_dir = os.getcwd()
-                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-            if self.config.trainer.storage_mode == 'aistudio':
-                global_step_folder = find_latest_ckpt_path_aistudio(checkpoint_folder)  # None if no latest
-            elif self.config.trainer.storage_mode == 'local':
-                global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+        resume_mode = self.config.trainer.resume_mode
+        global_step_folder = None
+        if resume_mode == 'auto':
+            # load from hdfs
+            if self.config.trainer.default_hdfs_dir is not None:
+                raise NotImplementedError('load from hdfs is not implemented yet')
             else:
-                raise NotImplementedError
-
-        # find global_step_folder
-        if self.config.trainer.resume_mode == 'auto':
+                checkpoint_folder = self.config.trainer.default_local_dir
+                if not os.path.isabs(checkpoint_folder):
+                    working_dir = os.getcwd()
+                    checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
+                if self.config.trainer.storage_mode == 'aistudio':
+                    global_step_folder = find_latest_ckpt_path_aistudio(checkpoint_folder)  # None if no latest
+                elif self.config.trainer.storage_mode == 'local':
+                    global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+                else:
+                    raise NotImplementedError
             if global_step_folder is None:
                 print('Training from scratch')
+                self._set_cursor_from_completed_steps(0)
+                self.rounds_scheduler.set_global_steps(1)
                 return 0
         else:
-            if not (self.config.trainer.resume_from_path and global_step_folder is not None):
-                assert isinstance(self.config.trainer.resume_mode, str), "resume ckpt must be str type"
-                assert 'global_step_' in self.config.trainer.resume_mode, "resume ckpt must specify the global_steps"
-                global_step_folder = self.config.trainer.resume_mode
-                if not os.path.isabs(global_step_folder):
-                    working_dir = os.getcwd()
-                    global_step_folder = os.path.join(working_dir, global_step_folder)
-        print(f'Load from checkpoint folder: {global_step_folder}')
-        # set global step
-        self.global_steps = int(global_step_folder.split('global_step_')[-1])
-        self.rounds_scheduler.set_global_steps(self.global_steps)
+            assert isinstance(resume_mode, str), "resume ckpt must be str type"
+            assert 'global_step_' in resume_mode, "resume ckpt must specify the global_steps"
+            global_step_folder = resume_mode
+            if not os.path.isabs(global_step_folder):
+                working_dir = os.getcwd()
+                global_step_folder = os.path.join(working_dir, global_step_folder)
 
-        print(f'Setting global step to {self.global_steps}')
+        print(f'Load from checkpoint folder: {global_step_folder}')
+
+        self._validate_checkpoint_files(global_step_folder)
+        trainer_state = self._load_trainer_state_or_infer(global_step_folder)
+
         print(f'Resuming from {global_step_folder}')
+        print(
+            f"Restored global_step={self.completed_steps}, epoch_idx={self.epoch_idx}, "
+            f"batch_idx_in_epoch={self.batch_idx_in_epoch}, next_step={self.completed_steps + 1}"
+        )
 
         actor_path = os.path.join(global_step_folder, 'actor')
         critic_path = os.path.join(global_step_folder, 'critic')
@@ -929,12 +1219,13 @@ class RayPPOTrainer(object):
             self.critic_wg.load_checkpoint(critic_path,
                                            del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
-        # load dataloader,
-        # TODO: from remote not implemented yet
-        dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
-        self.train_dataloader = torch.load(dataloader_local_path)
-        if isinstance(self.train_dataloader.dataset, RLHFDataset):
-            self.train_dataloader.dataset.resume_dataset_state()
+        if isinstance(self.train_dataset, RLHFDataset):
+            self.train_dataset.resume_dataset_state()
+
+        if trainer_state is None:
+            self.rounds_scheduler.set_global_steps(self.completed_steps + 1)
+
+        return self.completed_steps
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -1018,160 +1309,165 @@ class RayPPOTrainer(object):
                           default_backend=self.config.trainer.logger,
                           config=OmegaConf.to_container(self.config, resolve=True))
 
-        self.global_steps = 0
-
         # load checkpoint before doing anything
         self._load_checkpoint()
 
-        if self.config.trainer.storage_mode == 'aistudio':
+        if self.completed_steps >= self.total_training_steps:
+            print(
+                f"Checkpoint already completed training: completed_steps={self.completed_steps}, "
+                f"total_training_steps={self.total_training_steps}. Exiting."
+            )
+            return
+
+        if self.config.trainer.storage_mode == 'aistudio' and self.completed_steps == 0:
             self._save_checkpoint()
 
-        # we start from step 1
-        self.global_steps += 1
+        while self.completed_steps < self.total_training_steps:
+            self.global_steps = self.completed_steps + 1
+            self.rounds_scheduler.set_global_steps(self.global_steps)
+            batch_dict = self._get_train_batch()
 
-        for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
-                metrics = {}
-                timing_raw = {}
+            metrics = {}
+            timing_raw = {}
 
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
+            batch: DataProto = DataProto.from_single_dict(batch_dict)
 
-                # pop those keys for generation
-                gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'], non_tensor_batch_keys=['item_id', 'raw_prompt'])
-                gen_batch.meta_info['global_steps'] = self.global_steps
-                gen_batch.meta_info['max_rounds'] = self.rounds_scheduler.get_rounds()
-                metrics.update({
-                    'max_rounds': self.rounds_scheduler.get_rounds(),
-                })
+            # pop those keys for generation
+            gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'], non_tensor_batch_keys=['item_id', 'raw_prompt'])
+            gen_batch.meta_info['global_steps'] = self.global_steps
+            gen_batch.meta_info['max_rounds'] = self.rounds_scheduler.get_rounds()
+            metrics.update({
+                'max_rounds': self.rounds_scheduler.get_rounds(),
+            })
 
-                with _timer('step', timing_raw):
-                    # generate a batch
-                    with _timer('gen', timing_raw):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+            with _timer('step', timing_raw):
+                # generate a batch
+                with _timer('gen', timing_raw):
+                    gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
-                    if self.config.algorithm.adv_estimator == 'remax':
-                        with _timer('gen_max', timing_raw):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info['do_sample'] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                if self.config.algorithm.adv_estimator == 'remax':
+                    with _timer('gen_max', timing_raw):
+                        gen_baseline_batch = deepcopy(gen_batch)
+                        gen_baseline_batch.meta_info['do_sample'] = False
+                        gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = batch.batch['rewards']
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+                        batch = batch.union(gen_baseline_output)
+                        reward_baseline_tensor = batch.batch['rewards']
+                        reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+                        batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
 
-                            batch.batch['reward_baselines'] = reward_baseline_tensor
+                        batch.batch['reward_baselines'] = reward_baseline_tensor
 
-                            del gen_baseline_batch, gen_baseline_output
+                        del gen_baseline_batch, gen_baseline_output
 
-                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                             dtype=object)
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
-                    # 原因：动作格式/环境有效率只用于观测 rollout 质量，不参与 advantage 计算。
-                    metrics.update(compute_rollout_monitor_metrics(batch, prefix="rollout"))
-                    drop_rollout_monitor(batch)
+                batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                                         dtype=object)
+                # repeat to align with repeated responses in rollout
+                batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                batch = batch.union(gen_batch_output)
+                # 原因：动作格式/环境有效率只用于观测 rollout 质量，不参与 advantage 计算。
+                metrics.update(compute_rollout_monitor_metrics(batch, prefix="rollout"))
+                drop_rollout_monitor(batch)
 
-                    # balance the number of valid tokens on each dp rank.
-                    # Note that this breaks the order of data inside the batch.
-                    # Please take care when you implement group based adv computation such as GRPO and rloo
-                    self._balance_batch(batch, metrics=metrics)
+                # balance the number of valid tokens on each dp rank.
+                # Note that this breaks the order of data inside the batch.
+                # Please take care when you implement group based adv computation such as GRPO and rloo
+                self._balance_batch(batch, metrics=metrics)
 
-                    # compute global_valid tokens
-                    batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+                # compute global_valid tokens
+                batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
-                    # recompute old_log_probs
-                    with _timer('old_log_prob', timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        batch = batch.union(old_log_prob)
+                # recompute old_log_probs
+                with _timer('old_log_prob', timing_raw):
+                    old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                    batch = batch.union(old_log_prob)
 
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with _timer('ref', timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                if self.use_reference_policy:
+                    # compute reference log_prob
+                    with _timer('ref', timing_raw):
+                        ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                        batch = batch.union(ref_log_prob)
+
+                if bool(self.config.algorithm.g2rl.get('enabled', False)):
+                    with _timer('g2rl_feature', timing_raw):
+                        batch.meta_info['g2rl_feature_scope'] = str(self.config.algorithm.g2rl.get('feature_scope', 'response'))
+                        batch.meta_info['g2rl_feature_topk'] = int(self.config.algorithm.g2rl.get('feature_topk', 256))
+                        batch.meta_info['g2rl_token_chunk_size'] = int(self.config.algorithm.g2rl.get('token_chunk_size', 256))
+                        g2rl_features = self.actor_rollout_wg.compute_g2rl_features(batch)
+                        batch = batch.union(g2rl_features)
+
+                # compute values
+                if self.use_critic:
+                    with _timer('values', timing_raw):
+                        values = self.critic_wg.compute_values(batch)
+                        batch = batch.union(values)
+
+                with _timer('adv', timing_raw):
+                    # we combine with rule-based rm
+                    reward_tensor = batch.batch['scores']
+                    batch.batch['token_level_scores'] = reward_tensor
+
+                    # compute rewards. apply_kl_penalty if available
+                    if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                        batch, kl_metrics = apply_kl_penalty(batch,
+                                                             kl_ctrl=self.kl_ctrl,
+                                                             kl_penalty=self.config.algorithm.kl_penalty)
+                        metrics.update(kl_metrics)
+                    else:
+                        batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                     if bool(self.config.algorithm.g2rl.get('enabled', False)):
-                        with _timer('g2rl_feature', timing_raw):
-                            batch.meta_info['g2rl_feature_scope'] = str(self.config.algorithm.g2rl.get('feature_scope', 'response'))
-                            batch.meta_info['g2rl_feature_topk'] = int(self.config.algorithm.g2rl.get('feature_topk', 256))
-                            batch.meta_info['g2rl_token_chunk_size'] = int(self.config.algorithm.g2rl.get('token_chunk_size', 256))
-                            g2rl_features = self.actor_rollout_wg.compute_g2rl_features(batch)
-                            batch = batch.union(g2rl_features)
+                        batch, g2rl_metrics = apply_g2rl_reward_shaping(batch, self.config.algorithm.g2rl)
+                        metrics.update(g2rl_metrics)
 
-                    # compute values
-                    if self.use_critic:
-                        with _timer('values', timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
+                    # compute advantages, executed on the driver process
+                    batch = compute_advantage(batch,
+                                              adv_estimator=self.config.algorithm.adv_estimator,
+                                              gamma=self.config.algorithm.gamma,
+                                              lam=self.config.algorithm.lam,
+                                              num_repeat=self.config.actor_rollout_ref.rollout.n)
 
-                    with _timer('adv', timing_raw):
-                        # we combine with rule-based rm
-                        reward_tensor = batch.batch['scores']
-                        batch.batch['token_level_scores'] = reward_tensor
+                # update critic
+                if self.use_critic:
+                    with _timer('update_critic', timing_raw):
+                        critic_output = self.critic_wg.update_critic(batch)
+                    critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                    metrics.update(critic_output_metrics)
 
-                        # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+                # implement critic warmup
+                if self.config.trainer.critic_warmup <= self.global_steps:
+                    # update actor
+                    with _timer('update_actor', timing_raw):
+                        actor_output = self.actor_rollout_wg.update_actor(batch)
+                    actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                    metrics.update(actor_output_metrics)
 
-                        if bool(self.config.algorithm.g2rl.get('enabled', False)):
-                            batch, g2rl_metrics = apply_g2rl_reward_shaping(batch, self.config.algorithm.g2rl)
-                            metrics.update(g2rl_metrics)
+            # collect metrics
+            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
-                        # compute advantages, executed on the driver process
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+            # TODO: make a canonical logger that supports various backend
+            logger.log(data=metrics, step=self.global_steps)
 
-                    # update critic
-                    if self.use_critic:
-                        with _timer('update_critic', timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
-                        metrics.update(critic_output_metrics)
+            if self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0:
+                # 注意：eval 走固定 batch 和当前 rollout 配置，不保存训练梯度。
+                eval_metrics = self._run_eval_rollout()
+                if eval_metrics:
+                    logger.log(data=eval_metrics, step=self.global_steps)
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with _timer('update_actor', timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                        metrics.update(actor_output_metrics)
+            current_step = self.global_steps
+            self.completed_steps = current_step
+            self._advance_train_cursor()
+            self.global_steps = self.completed_steps
+            self.rounds_scheduler.set_global_steps(self.completed_steps + 1)
 
-                    if self.config.trainer.save_freq > 0 and \
-                            self.global_steps % self.config.trainer.save_freq == 0:
-                        with _timer('save_checkpoint', timing_raw):
-                            self._save_checkpoint()
+            should_save = self.config.trainer.save_freq > 0 and (
+                self.completed_steps % self.config.trainer.save_freq == 0 or
+                self.completed_steps >= self.total_training_steps
+            )
+            if should_save:
+                self._save_checkpoint()
 
-                # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-
-                # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
-
-                if self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0:
-                    # 注意：eval 走固定 batch 和当前 rollout 配置，不保存训练梯度。
-                    eval_metrics = self._run_eval_rollout()
-                    if eval_metrics:
-                        logger.log(data=eval_metrics, step=self.global_steps)
-
-                self.global_steps += 1
-                self.rounds_scheduler.step()
-
-                if self.global_steps >= self.total_training_steps:
-
-                    if self.config.trainer.save_freq > 0 and \
-                            (self.global_steps - 1) % self.config.trainer.save_freq != 0:
-                        with _timer('save_checkpoint', timing_raw):
-                            self._save_checkpoint()
-                    return
+            if self.completed_steps >= self.total_training_steps:
+                return

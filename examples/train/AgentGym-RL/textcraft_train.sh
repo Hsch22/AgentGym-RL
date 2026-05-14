@@ -120,11 +120,21 @@ feature_chunk_size="${TEXTCRAFT_FEATURE_CHUNK_SIZE:-4}"
 gradient_model_path=${agent_model_path}
 
 model_save_dir="${TEXTCRAFT_MODEL_SAVE_DIR:-saves}"
-mkdir -p ${model_save_dir}
-exp_name="${TEXTCRAFT_EXP_NAME:-textcraft_paper_g2rl_action_feature_no_cluster_scalinginter_2xh200_$(date +%Y%m%d_%H%M)}"
-model_save_path=${model_save_dir}/${exp_name}
+mkdir -p "${model_save_dir}"
+default_exp_name="textcraft_paper_g2rl_action_feature_no_cluster_scalinginter_2xh200"
+if [[ -n "${TEXTCRAFT_MODEL_SAVE_PATH:-}" ]]; then
+    model_save_path="${TEXTCRAFT_MODEL_SAVE_PATH}"
+    exp_name="${TEXTCRAFT_EXP_NAME:-$(basename "${model_save_path}")}"
+else
+    exp_name="${TEXTCRAFT_EXP_NAME:-${default_exp_name}}"
+    model_save_path="${model_save_dir}/${exp_name}"
+fi
+resume_mode="${TEXTCRAFT_RESUME_MODE:-auto}"
+if [[ -n "${TEXTCRAFT_RESUME_CKPT:-}" ]]; then
+    resume_mode="${TEXTCRAFT_RESUME_CKPT}"
+fi
 
-mkdir -p ${model_save_path}
+mkdir -p "${model_save_path}"
 
 echo "[full-run] task=${task_name} model=${agent_model_path}"
 echo "[full-run] train_gpus=${CUDA_VISIBLE_DEVICES} n_gpus_per_node=${n_gpus_per_node}"
@@ -137,7 +147,7 @@ echo "[full-run] use_remove_padding=${use_remove_padding} entropy_chunk_size=${e
 echo "[full-run] g2rl_enabled=${g2rl_enabled} feature_scope=${g2rl_feature_scope} lambda=${g2rl_lambda_coef} reward_clip=${g2rl_reward_clip} zero_one_to_signed=${g2rl_zero_one_to_signed} feature_topk=${g2rl_feature_topk} token_chunk_size=${g2rl_token_chunk_size}"
 echo "[full-run] clustering=${clustering_method} enabled=${clustering_enabled} round1=${round1_candidates}/${round1_clusters} later=${later_candidates}/${later_clusters}"
 echo "[full-run] later_cluster_schedule=every:${later_cluster_every},start:${later_cluster_start},until:${later_cluster_until},horizon_min:${later_cluster_horizon_min}"
-echo "[full-run] save_freq=${save_freq} test_freq=${test_freq} test_batches=${test_batches} tmpdir=${TMPDIR} logs=${model_save_path}"
+echo "[full-run] save_freq=${save_freq} test_freq=${test_freq} test_batches=${test_batches} resume_mode=${resume_mode} tmpdir=${TMPDIR} logs=${model_save_path}"
 
 "${VENVPY}" -m verl.agent_trainer.main_ppo  \
     algorithm.adv_estimator=grpo \
@@ -197,6 +207,7 @@ echo "[full-run] save_freq=${save_freq} test_freq=${test_freq} test_batches=${te
     trainer.default_local_dir=${model_save_path} \
     trainer.project_name=agentgym-rl-textcraft \
     trainer.experiment_name=${exp_name} \
+    "trainer.resume_mode=${resume_mode}" \
     trainer.save_freq=${save_freq} \
     trainer.test_freq=${test_freq} \
     trainer.test_batches=${test_batches} \
