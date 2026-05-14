@@ -51,7 +51,7 @@ class BasePPOActor(ABC):
         pass
 
     def compute_g2rl_features(self, data: DataProto) -> torch.Tensor:
-        """Compute trajectory-level G2RL sensitivity features."""
+        """Compute configured-scope G2RL sensitivity features."""
         raise NotImplementedError
 
     @abstractmethod

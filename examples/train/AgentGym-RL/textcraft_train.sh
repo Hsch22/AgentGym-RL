@@ -91,8 +91,9 @@ export VERL_ENTROPY_CHUNK_SIZE="${entropy_chunk_size}"
 
 # ==== paper-style G2RL reward shaping ====
 # Default run keeps rollout sampling identical to the ScalingInter baseline and
-# applies trajectory-level G2RL only before GRPO advantage computation.
+# applies G2RL only before GRPO advantage computation.
 g2rl_enabled="${TEXTCRAFT_G2RL_ENABLED:-true}"
+g2rl_feature_scope="${TEXTCRAFT_G2RL_FEATURE_SCOPE:-action}"
 g2rl_lambda_coef="${TEXTCRAFT_G2RL_LAMBDA_COEF:-1.0}"
 g2rl_reward_clip="${TEXTCRAFT_G2RL_REWARD_CLIP:-3.0}"
 g2rl_zero_one_to_signed="${TEXTCRAFT_G2RL_ZERO_ONE_TO_SIGNED:-true}"
@@ -120,7 +121,7 @@ gradient_model_path=${agent_model_path}
 
 model_save_dir="${TEXTCRAFT_MODEL_SAVE_DIR:-saves}"
 mkdir -p ${model_save_dir}
-exp_name="${TEXTCRAFT_EXP_NAME:-textcraft_paper_g2rl_no_cluster_scalinginter_2xh200_$(date +%Y%m%d_%H%M)}"
+exp_name="${TEXTCRAFT_EXP_NAME:-textcraft_paper_g2rl_action_feature_no_cluster_scalinginter_2xh200_$(date +%Y%m%d_%H%M)}"
 model_save_path=${model_save_dir}/${exp_name}
 
 mkdir -p ${model_save_path}
@@ -133,7 +134,7 @@ echo "[full-run] total_trajectories_per_step=$((train_batch_size * rollout_sampl
 echo "[full-run] ppo_mini_batch_size=${ppo_mini_batch_size} ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}"
 echo "[full-run] max_prompt_length=${max_prompt_length} max_response_length=${max_response_length} rollout_max_model_len=${rollout_max_model_len} rollout_max_num_batched_tokens=${rollout_max_num_batched_tokens} rollout_max_tokens=${rollout_max_tokens}"
 echo "[full-run] use_remove_padding=${use_remove_padding} entropy_chunk_size=${entropy_chunk_size} rollout_gpu_memory_utilization=${rollout_gpu_memory_utilization}"
-echo "[full-run] g2rl_enabled=${g2rl_enabled} lambda=${g2rl_lambda_coef} reward_clip=${g2rl_reward_clip} zero_one_to_signed=${g2rl_zero_one_to_signed} feature_topk=${g2rl_feature_topk} token_chunk_size=${g2rl_token_chunk_size}"
+echo "[full-run] g2rl_enabled=${g2rl_enabled} feature_scope=${g2rl_feature_scope} lambda=${g2rl_lambda_coef} reward_clip=${g2rl_reward_clip} zero_one_to_signed=${g2rl_zero_one_to_signed} feature_topk=${g2rl_feature_topk} token_chunk_size=${g2rl_token_chunk_size}"
 echo "[full-run] clustering=${clustering_method} enabled=${clustering_enabled} round1=${round1_candidates}/${round1_clusters} later=${later_candidates}/${later_clusters}"
 echo "[full-run] later_cluster_schedule=every:${later_cluster_every},start:${later_cluster_start},until:${later_cluster_until},horizon_min:${later_cluster_horizon_min}"
 echo "[full-run] save_freq=${save_freq} test_freq=${test_freq} test_batches=${test_batches} tmpdir=${TMPDIR} logs=${model_save_path}"
@@ -144,6 +145,7 @@ echo "[full-run] save_freq=${save_freq} test_freq=${test_freq} test_batches=${te
     algorithm.rounds_ctrl.steps_scaling_inter=${rounds_scaling_inter} \
     "algorithm.rounds_ctrl.rounds=${rounds_schedule}" \
     algorithm.g2rl.enabled=${g2rl_enabled} \
+    algorithm.g2rl.feature_scope=${g2rl_feature_scope} \
     algorithm.g2rl.lambda_coef=${g2rl_lambda_coef} \
     algorithm.g2rl.reward_clip=${g2rl_reward_clip} \
     algorithm.g2rl.zero_one_to_signed=${g2rl_zero_one_to_signed} \

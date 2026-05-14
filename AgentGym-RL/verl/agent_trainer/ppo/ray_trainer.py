@@ -1095,6 +1095,7 @@ class RayPPOTrainer(object):
 
                     if bool(self.config.algorithm.g2rl.get('enabled', False)):
                         with _timer('g2rl_feature', timing_raw):
+                            batch.meta_info['g2rl_feature_scope'] = str(self.config.algorithm.g2rl.get('feature_scope', 'response'))
                             batch.meta_info['g2rl_feature_topk'] = int(self.config.algorithm.g2rl.get('feature_topk', 256))
                             batch.meta_info['g2rl_token_chunk_size'] = int(self.config.algorithm.g2rl.get('token_chunk_size', 256))
                             g2rl_features = self.actor_rollout_wg.compute_g2rl_features(batch)

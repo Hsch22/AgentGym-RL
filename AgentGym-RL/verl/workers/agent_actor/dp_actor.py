@@ -206,6 +206,7 @@ class DataParallelPPOActor(BasePPOActor):
     def _forward_g2rl_features_micro_batch(self, micro_batch, temperature, feature_topk, token_chunk_size):
         response_length = micro_batch['responses'].size(-1)
         response_mask = micro_batch['response_mask'].bool()
+        feature_mask = micro_batch.get('g2rl_feature_mask', response_mask).bool() & response_mask
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             input_ids = micro_batch['input_ids']
             batch_size, seqlen = input_ids.shape
@@ -213,11 +214,11 @@ class DataParallelPPOActor(BasePPOActor):
             position_ids = micro_batch['position_ids']
             responses = micro_batch['responses']
 
-            if not torch.any(response_mask):
+            if not torch.any(feature_mask):
                 hidden_size = self._get_output_embedding_weight().shape[1]
                 return torch.zeros(batch_size, hidden_size, dtype=torch.float32, device=input_ids.device)
 
-            sample_ids, response_offsets = torch.where(response_mask)
+            sample_ids, response_offsets = torch.where(feature_mask)
             target_ids = responses[sample_ids, response_offsets].long()
 
             if self.use_remove_padding:
@@ -279,7 +280,7 @@ class DataParallelPPOActor(BasePPOActor):
                 logits = output.logits
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1, :]
-                token_logits = logits[response_mask]
+                token_logits = logits[feature_mask]
 
             return self._accumulate_g2rl_features(
                 token_logits=token_logits,
@@ -300,6 +301,8 @@ class DataParallelPPOActor(BasePPOActor):
         token_chunk_size = int(data.meta_info.get('g2rl_token_chunk_size', 256))
 
         select_keys = ['responses', 'response_mask', 'input_ids', 'attention_mask', 'position_ids']
+        if 'g2rl_feature_mask' in data.batch.keys():
+            select_keys.append('g2rl_feature_mask')
         batch = data.select(batch_keys=select_keys).batch
 
         if use_dynamic_bsz:

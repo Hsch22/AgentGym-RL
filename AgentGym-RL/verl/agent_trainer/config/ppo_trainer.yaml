@@ -212,6 +212,7 @@ algorithm:
     steps_scaling_inter: 100  # Frequency (in training steps) to increase the maximum number of turns when using `scaling_inter_stepwise`.
   g2rl:
     enabled: false             # Paper-style trajectory-level G2RL reward shaping before advantage computation
+    feature_scope: response    # response keeps legacy trajectory-level features; action keeps only TextCraft Action contents
     lambda_coef: 1.0           # Multiplicative novelty strength: shaped_signed = signed_reward * (1 + lambda * novelty)
     reward_clip: 3.0           # Clip shaped signed reward to [-reward_clip, reward_clip]
     zero_one_to_signed: true   # Map 0/1 task success to -1/+1 before shaping

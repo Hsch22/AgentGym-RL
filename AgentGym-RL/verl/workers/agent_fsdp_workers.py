@@ -17,7 +17,9 @@ The main entry point to run the PPO algorithm
 
 import logging
 import os
+import re
 import warnings
+from typing import List, Tuple
 
 import torch
 import torch.distributed
@@ -42,6 +44,91 @@ from codetiming import Timer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
+
+_TEXTCRAFT_ACTION_RE = re.compile(r"Action\s*:", re.IGNORECASE)
+_TEXTCRAFT_NEXT_MARKER_RE = re.compile(r"(?:^|\n)\s*(?:Thought|Action|Observation)\s*:", re.IGNORECASE)
+
+
+def find_textcraft_action_spans(text: str) -> List[Tuple[int, int]]:
+    """Return character spans for TextCraft action contents, excluding Thought text."""
+    spans: List[Tuple[int, int]] = []
+    for action_match in _TEXTCRAFT_ACTION_RE.finditer(text):
+        start = action_match.end()
+        next_marker = _TEXTCRAFT_NEXT_MARKER_RE.search(text, start)
+        end = next_marker.start() if next_marker is not None else len(text)
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if end > start:
+            spans.append((start, end))
+    return spans
+
+
+def _token_count(tokenizer, text: str) -> int:
+    try:
+        return len(tokenizer.encode(text, add_special_tokens=False))
+    except TypeError:
+        return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+
+def _span_token_mask(tokenizer, text: str, spans: List[Tuple[int, int]], token_count: int) -> List[bool]:
+    try:
+        encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        offsets = encoded["offset_mapping"]
+    except (NotImplementedError, TypeError, KeyError):
+        offsets = None
+
+    selected = [False] * token_count
+    if offsets is not None and len(offsets) == token_count:
+        for token_idx, (token_start, token_end) in enumerate(offsets):
+            if token_end <= token_start:
+                continue
+            for span_start, span_end in spans:
+                if token_end > span_start and token_start < span_end:
+                    selected[token_idx] = True
+                    break
+        return selected
+
+    for start_char, end_char in spans:
+        start_token = _token_count(tokenizer, text[:start_char])
+        end_token = _token_count(tokenizer, text[:end_char])
+        start_token = max(0, min(start_token, token_count))
+        end_token = max(start_token, min(end_token, token_count))
+        for token_idx in range(start_token, end_token):
+            selected[token_idx] = True
+    return selected
+
+
+def build_textcraft_action_feature_mask(responses: torch.Tensor,
+                                        response_mask: torch.Tensor,
+                                        tokenizer) -> torch.Tensor:
+    """Build a response-shaped mask that keeps only TextCraft Action contents."""
+    response_mask = response_mask.bool()
+    feature_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+
+    for row_idx in range(responses.size(0)):
+        valid_positions = torch.nonzero(response_mask[row_idx], as_tuple=False).squeeze(-1)
+        if valid_positions.numel() == 0:
+            continue
+
+        token_ids = responses[row_idx, valid_positions].detach().cpu().tolist()
+        text = tokenizer.decode(token_ids, skip_special_tokens=True)
+        spans = find_textcraft_action_spans(text)
+
+        token_selection = _span_token_mask(tokenizer, text, spans, valid_positions.numel())
+        if any(token_selection):
+            selected_positions = valid_positions[torch.tensor(
+                token_selection,
+                dtype=torch.bool,
+                device=valid_positions.device,
+            )]
+            feature_mask[row_idx, selected_positions] = True
+
+        if not torch.any(feature_mask[row_idx]):
+            feature_mask[row_idx, valid_positions] = True
+
+    return feature_mask
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -567,11 +654,24 @@ class ActorRolloutRefWorker(Worker):
             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
                                      device_id=torch.cuda.current_device(),
                                      load_grad=self._is_offload_grad)
+        feature_scope = str(data.meta_info.get('g2rl_feature_scope', 'response')).lower()
+        if feature_scope in ('trajectory', 'response'):
+            feature_scope = 'response'
+        elif feature_scope == 'action':
+            data.batch['g2rl_feature_mask'] = build_textcraft_action_feature_mask(
+                responses=data.batch['responses'],
+                response_mask=data.batch['response_mask'],
+                tokenizer=self.tokenizer,
+            )
+        else:
+            raise ValueError(f"Unsupported g2rl_feature_scope={feature_scope!r}; expected 'response' or 'action'")
+
         data = data.to('cuda')
         data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info['temperature'] = self.config.rollout.temperature
+        data.meta_info['g2rl_feature_scope'] = feature_scope
         data.meta_info['g2rl_feature_topk'] = int(data.meta_info.get('g2rl_feature_topk', 256))
         data.meta_info['g2rl_token_chunk_size'] = int(data.meta_info.get('g2rl_token_chunk_size', 256))
 
