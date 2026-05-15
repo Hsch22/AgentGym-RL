@@ -47,6 +47,32 @@ logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
 _TEXTCRAFT_ACTION_RE = re.compile(r"Action\s*:", re.IGNORECASE)
 _TEXTCRAFT_NEXT_MARKER_RE = re.compile(r"(?:^|\n)\s*(?:Thought|Action|Observation)\s*:", re.IGNORECASE)
+_TEXTCRAFT_MARKER_PREFIXES = ("", " ", "  ", "    ", "\t", "\n", "\n ", "\n  ", "\n    ", "\n\t")
+_TEXTCRAFT_MARKERS = {
+    "thought": "Thought:",
+    "action": "Action:",
+    "observation": "Observation:",
+}
+_TEXTCRAFT_UNSUPPORTED_MARKERS = (
+    "thought:",
+    "action:",
+    "observation:",
+    "THOUGHT:",
+    "ACTION:",
+    "OBSERVATION:",
+    "Thought :",
+    "Action :",
+    "Observation :",
+    "Thought  :",
+    "Action  :",
+    "Observation  :",
+    "Thought\t:",
+    "Action\t:",
+    "Observation\t:",
+)
+_TEXTCRAFT_MARKER_CACHE = {}
+_TEXTCRAFT_UNSUPPORTED_MARKER_CACHE = {}
+_TEXTCRAFT_TOKEN_KIND_CACHE = {}
 
 
 def find_textcraft_action_spans(text: str) -> List[Tuple[int, int]]:
@@ -70,6 +96,183 @@ def _token_count(tokenizer, text: str) -> int:
         return len(tokenizer.encode(text, add_special_tokens=False))
     except TypeError:
         return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+
+def _encode_token_ids(tokenizer, text: str) -> Tuple[int, ...]:
+    try:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    if hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+    return tuple(int(token_id) for token_id in token_ids)
+
+
+def _build_textcraft_marker_specs(tokenizer, marker_texts):
+    specs = []
+    seen = set()
+    for marker_name, marker_text in marker_texts:
+        for prefix in _TEXTCRAFT_MARKER_PREFIXES:
+            token_ids = _encode_token_ids(tokenizer, f"{prefix}{marker_text}")
+            if not token_ids:
+                continue
+            start_only = not prefix.startswith("\n")
+            key = (marker_name, token_ids, start_only)
+            if key in seen:
+                continue
+            seen.add(key)
+            specs.append((token_ids, marker_name, start_only))
+    specs.sort(key=lambda item: len(item[0]), reverse=True)
+    return tuple(specs)
+
+
+def _index_textcraft_marker_specs(specs):
+    indexed = {}
+    for spec in specs:
+        marker_ids = spec[0]
+        indexed.setdefault(marker_ids[0], []).append(spec)
+    return {token_id: tuple(token_specs) for token_id, token_specs in indexed.items()}
+
+
+def _get_textcraft_marker_specs(tokenizer):
+    cache_key = id(tokenizer)
+    cached = _TEXTCRAFT_MARKER_CACHE.get(cache_key)
+    if cached is not None and cached[0] is tokenizer:
+        return cached[1]
+
+    specs = _build_textcraft_marker_specs(tokenizer, _TEXTCRAFT_MARKERS.items())
+    indexed = _index_textcraft_marker_specs(specs)
+    _TEXTCRAFT_MARKER_CACHE[cache_key] = (tokenizer, indexed)
+    return indexed
+
+
+def _get_textcraft_unsupported_marker_specs(tokenizer):
+    cache_key = id(tokenizer)
+    cached = _TEXTCRAFT_UNSUPPORTED_MARKER_CACHE.get(cache_key)
+    if cached is not None and cached[0] is tokenizer:
+        return cached[1]
+
+    marker_texts = tuple((marker_text, marker_text) for marker_text in _TEXTCRAFT_UNSUPPORTED_MARKERS)
+    specs = _build_textcraft_marker_specs(tokenizer, marker_texts)
+    indexed = _index_textcraft_marker_specs(specs)
+    _TEXTCRAFT_UNSUPPORTED_MARKER_CACHE[cache_key] = (tokenizer, indexed)
+    return indexed
+
+
+def _token_id_is_special(tokenizer, token_id: int) -> bool:
+    cache_key = (id(tokenizer), "special", int(token_id))
+    if cache_key in _TEXTCRAFT_TOKEN_KIND_CACHE:
+        return _TEXTCRAFT_TOKEN_KIND_CACHE[cache_key]
+
+    special_ids = set(getattr(tokenizer, "all_special_ids", None) or ())
+    for attr_name in ("pad_token_id", "eos_token_id", "bos_token_id"):
+        attr_value = getattr(tokenizer, attr_name, None)
+        if attr_value is not None:
+            special_ids.add(int(attr_value))
+    result = int(token_id) in special_ids
+    _TEXTCRAFT_TOKEN_KIND_CACHE[cache_key] = result
+    return result
+
+
+def _token_id_decodes_to_whitespace(tokenizer, token_id: int) -> bool:
+    cache_key = (id(tokenizer), "whitespace", int(token_id))
+    if cache_key in _TEXTCRAFT_TOKEN_KIND_CACHE:
+        return _TEXTCRAFT_TOKEN_KIND_CACHE[cache_key]
+
+    if _token_id_is_special(tokenizer, token_id):
+        result = False
+    else:
+        text = tokenizer.decode([int(token_id)], skip_special_tokens=True)
+        result = bool(text) and text.isspace()
+    _TEXTCRAFT_TOKEN_KIND_CACHE[cache_key] = result
+    return result
+
+
+def _token_id_allows_line_marker_after(tokenizer, token_id: int) -> bool:
+    cache_key = (id(tokenizer), "line_marker_after", int(token_id))
+    if cache_key in _TEXTCRAFT_TOKEN_KIND_CACHE:
+        return _TEXTCRAFT_TOKEN_KIND_CACHE[cache_key]
+
+    if _token_id_is_special(tokenizer, token_id):
+        result = False
+    else:
+        text = tokenizer.decode([int(token_id)], skip_special_tokens=True)
+        result = "\n" in text and text.rsplit("\n", 1)[1].strip() == ""
+    _TEXTCRAFT_TOKEN_KIND_CACHE[cache_key] = result
+    return result
+
+
+def _textcraft_start_only_marker_allowed(token_ids: List[int], pos: int, tokenizer) -> bool:
+    if pos == 0:
+        return True
+    return _token_id_allows_line_marker_after(tokenizer, token_ids[pos - 1])
+
+
+def _match_textcraft_specs_at(token_ids: List[int], pos: int, specs, tokenizer) -> Tuple[int, str]:
+    for marker_ids, marker_name, start_only in specs.get(token_ids[pos], ()):
+        if start_only and not _textcraft_start_only_marker_allowed(token_ids, pos, tokenizer):
+            continue
+        marker_len = len(marker_ids)
+        if pos + marker_len <= len(token_ids) and tuple(token_ids[pos:pos + marker_len]) == marker_ids:
+            return marker_len, marker_name
+    return 0, ""
+
+
+def _has_unsupported_textcraft_marker(token_ids: List[int], tokenizer) -> bool:
+    unsupported_specs = _get_textcraft_unsupported_marker_specs(tokenizer)
+    for pos in range(len(token_ids)):
+        marker_len, _ = _match_textcraft_specs_at(token_ids, pos, unsupported_specs, tokenizer)
+        if marker_len:
+            return True
+    return False
+
+
+def _find_fast_textcraft_markers(token_ids: List[int], tokenizer):
+    marker_specs = _get_textcraft_marker_specs(tokenizer)
+    markers = []
+    pos = 0
+    while pos < len(token_ids):
+        marker_len, marker_name = _match_textcraft_specs_at(token_ids, pos, marker_specs, tokenizer)
+        if marker_len:
+            markers.append((pos, pos + marker_len, marker_name))
+            pos += marker_len
+        else:
+            pos += 1
+    return markers
+
+
+def _build_textcraft_action_token_selection_fast(token_ids: List[int], tokenizer):
+    if _has_unsupported_textcraft_marker(token_ids, tokenizer):
+        return None
+
+    markers = _find_fast_textcraft_markers(token_ids, tokenizer)
+    if not any(marker_name == "action" for _, _, marker_name in markers):
+        return None
+
+    selected = [False] * len(token_ids)
+    for marker_idx, (marker_start, marker_end, marker_name) in enumerate(markers):
+        if marker_name != "action":
+            continue
+
+        span_start = marker_end
+        span_end = len(token_ids)
+        for next_start, _, _ in markers[marker_idx + 1:]:
+            if next_start >= span_start:
+                span_end = next_start
+                break
+
+        while span_start < span_end and _token_id_decodes_to_whitespace(tokenizer, token_ids[span_start]):
+            span_start += 1
+        while span_end > span_start and _token_id_decodes_to_whitespace(tokenizer, token_ids[span_end - 1]):
+            span_end -= 1
+
+        for token_idx in range(span_start, span_end):
+            if not _token_id_is_special(tokenizer, token_ids[token_idx]):
+                selected[token_idx] = True
+
+    if not any(selected):
+        return [True] * len(token_ids)
+    return selected
 
 
 def _span_token_mask(tokenizer, text: str, spans: List[Tuple[int, int]], token_count: int) -> List[bool]:
@@ -100,10 +303,10 @@ def _span_token_mask(tokenizer, text: str, spans: List[Tuple[int, int]], token_c
     return selected
 
 
-def build_textcraft_action_feature_mask(responses: torch.Tensor,
-                                        response_mask: torch.Tensor,
-                                        tokenizer) -> torch.Tensor:
-    """Build a response-shaped mask that keeps only TextCraft Action contents."""
+def build_textcraft_action_feature_mask_slow(responses: torch.Tensor,
+                                             response_mask: torch.Tensor,
+                                             tokenizer) -> torch.Tensor:
+    """Build TextCraft action masks through decode/regex/offset mapping."""
     response_mask = response_mask.bool()
     feature_mask = torch.zeros_like(response_mask, dtype=torch.bool)
 
@@ -129,6 +332,45 @@ def build_textcraft_action_feature_mask(responses: torch.Tensor,
             feature_mask[row_idx, valid_positions] = True
 
     return feature_mask
+
+
+def build_textcraft_action_feature_mask_fast(responses: torch.Tensor,
+                                             response_mask: torch.Tensor,
+                                             tokenizer) -> torch.Tensor:
+    """Build TextCraft action masks with a token-level fast path and slow fallback."""
+    response_mask = response_mask.bool()
+    feature_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+
+    for row_idx in range(responses.size(0)):
+        valid_positions = torch.nonzero(response_mask[row_idx], as_tuple=False).squeeze(-1)
+        if valid_positions.numel() == 0:
+            continue
+
+        token_ids = responses[row_idx, valid_positions].detach().cpu().tolist()
+        token_selection = _build_textcraft_action_token_selection_fast(token_ids, tokenizer)
+        if token_selection is None:
+            feature_mask[row_idx:row_idx + 1] = build_textcraft_action_feature_mask_slow(
+                responses=responses[row_idx:row_idx + 1],
+                response_mask=response_mask[row_idx:row_idx + 1],
+                tokenizer=tokenizer,
+            )
+            continue
+
+        selected_positions = valid_positions[torch.tensor(
+            token_selection,
+            dtype=torch.bool,
+            device=valid_positions.device,
+        )]
+        feature_mask[row_idx, selected_positions] = True
+
+    return feature_mask
+
+
+def build_textcraft_action_feature_mask(responses: torch.Tensor,
+                                        response_mask: torch.Tensor,
+                                        tokenizer) -> torch.Tensor:
+    """Build a response-shaped mask that keeps only TextCraft Action contents."""
+    return build_textcraft_action_feature_mask_fast(responses, response_mask, tokenizer)
 
 
 def create_device_mesh(world_size, fsdp_size):

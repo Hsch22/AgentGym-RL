@@ -72,6 +72,7 @@ ppo_mini_batch_size="${TEXTCRAFT_PPO_MINI_BATCH_SIZE:-8}"
 ppo_micro_batch_size_per_gpu="${TEXTCRAFT_PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 ppo_inner_epochs="${TEXTCRAFT_PPO_EPOCHS:-2}"
 total_epoches="${TEXTCRAFT_TOTAL_EPOCHS:-30}"
+total_training_steps="${TEXTCRAFT_TOTAL_TRAINING_STEPS:-}"
 max_prompt_length="${TEXTCRAFT_MAX_PROMPT_LENGTH:-512}"
 max_response_length="${TEXTCRAFT_MAX_RESPONSE_LENGTH:-10240}"
 use_remove_padding="${TEXTCRAFT_USE_REMOVE_PADDING:-true}"
@@ -133,6 +134,10 @@ resume_mode="${TEXTCRAFT_RESUME_MODE:-auto}"
 if [[ -n "${TEXTCRAFT_RESUME_CKPT:-}" ]]; then
     resume_mode="${TEXTCRAFT_RESUME_CKPT}"
 fi
+trainer_total_training_steps_arg=()
+if [[ -n "${total_training_steps}" ]]; then
+    trainer_total_training_steps_arg=("trainer.total_training_steps=${total_training_steps}")
+fi
 
 mkdir -p "${model_save_path}"
 
@@ -148,6 +153,9 @@ echo "[full-run] g2rl_enabled=${g2rl_enabled} feature_scope=${g2rl_feature_scope
 echo "[full-run] clustering=${clustering_method} enabled=${clustering_enabled} round1=${round1_candidates}/${round1_clusters} later=${later_candidates}/${later_clusters}"
 echo "[full-run] later_cluster_schedule=every:${later_cluster_every},start:${later_cluster_start},until:${later_cluster_until},horizon_min:${later_cluster_horizon_min}"
 echo "[full-run] save_freq=${save_freq} test_freq=${test_freq} test_batches=${test_batches} resume_mode=${resume_mode} tmpdir=${TMPDIR} logs=${model_save_path}"
+if [[ -n "${total_training_steps}" ]]; then
+    echo "[full-run] total_training_steps_override=${total_training_steps}"
+fi
 
 "${VENVPY}" -m verl.agent_trainer.main_ppo  \
     algorithm.adv_estimator=grpo \
@@ -214,6 +222,7 @@ echo "[full-run] save_freq=${save_freq} test_freq=${test_freq} test_batches=${te
     trainer.total_epochs=${total_epoches} \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=${n_gpus_per_node} \
+    "${trainer_total_training_steps_arg[@]}" \
     "trainer.logger=[console,wandb]"
 status=$?
 exit $status

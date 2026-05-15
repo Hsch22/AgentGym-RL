@@ -1,6 +1,12 @@
 import torch
 
-from verl.workers.agent_fsdp_workers import build_textcraft_action_feature_mask, find_textcraft_action_spans
+from verl.workers.agent_fsdp_workers import (
+    _build_textcraft_action_token_selection_fast,
+    build_textcraft_action_feature_mask,
+    build_textcraft_action_feature_mask_fast,
+    build_textcraft_action_feature_mask_slow,
+    find_textcraft_action_spans,
+)
 
 
 class CharTokenizer:
@@ -31,6 +37,18 @@ def _batch_texts(tokenizer, texts):
     return responses, response_mask
 
 
+def _selected_texts(tokenizer, responses, feature_mask):
+    return [
+        tokenizer.decode(responses[row_idx, feature_mask[row_idx]].tolist())
+        for row_idx in range(responses.size(0))
+    ]
+
+
+def _fast_selection_for_text(tokenizer, text):
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    return _build_textcraft_action_token_selection_fast(token_ids, tokenizer)
+
+
 def test_textcraft_action_spans_exclude_thought_and_observation():
     text = 'Thought: inspect\nAction: inventory\nObservation: ok\nThought: craft\nAction: craft plank'
 
@@ -53,3 +71,53 @@ def test_action_feature_mask_keeps_multiple_actions_and_falls_back_without_marke
 
     assert selected_first == 'inventorycraft plank'
     assert selected_second == texts[1]
+
+
+def test_fast_action_feature_mask_matches_slow_for_canonical_textcraft_rows():
+    tokenizer = CharTokenizer()
+    texts = [
+        'Action: inventory',
+        ' Thought: inspect\n Action: inventory\n Observation: ok',
+        'Thought: inspect\nAction: inventory\nObservation: ok\nThought: craft\nAction: craft plank',
+        'Thought: inspect\nAction: inventory\nAction: craft plank\nObservation: ok',
+    ]
+    responses, response_mask = _batch_texts(tokenizer, texts)
+
+    fast_mask = build_textcraft_action_feature_mask_fast(responses, response_mask, tokenizer)
+    slow_mask = build_textcraft_action_feature_mask_slow(responses, response_mask, tokenizer)
+    default_mask = build_textcraft_action_feature_mask(responses, response_mask, tokenizer)
+
+    assert torch.equal(fast_mask, slow_mask)
+    assert torch.equal(default_mask, slow_mask)
+    assert _selected_texts(tokenizer, responses, fast_mask) == [
+        'inventory',
+        'inventory',
+        'inventorycraft plank',
+        'inventorycraft plank',
+    ]
+    for text in texts:
+        assert _fast_selection_for_text(tokenizer, text) is not None
+
+
+def test_fast_action_feature_mask_uses_slow_fallback_for_no_marker_and_unsupported_formats():
+    tokenizer = CharTokenizer()
+    texts = [
+        'plain invalid response',
+        'Thought: inspect\nAction : inventory\nObservation: ok',
+        'Action: inventory\nObservation : ok',
+        'thought: inspect\naction: inventory\nobservation: ok',
+    ]
+    responses, response_mask = _batch_texts(tokenizer, texts)
+
+    fast_mask = build_textcraft_action_feature_mask_fast(responses, response_mask, tokenizer)
+    slow_mask = build_textcraft_action_feature_mask_slow(responses, response_mask, tokenizer)
+
+    assert torch.equal(fast_mask, slow_mask)
+    assert _selected_texts(tokenizer, responses, fast_mask) == [
+        texts[0],
+        'inventory',
+        'inventory',
+        'inventory',
+    ]
+    for text in texts:
+        assert _fast_selection_for_text(tokenizer, text) is None
