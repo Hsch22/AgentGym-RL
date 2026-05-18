@@ -50,6 +50,8 @@ ppo_micro_batch_size_per_gpu="${SCIWORLD_PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 ppo_inner_epochs="${SCIWORLD_PPO_EPOCHS:-1}"
 use_remove_padding="${SCIWORLD_USE_REMOVE_PADDING:-true}"
 rollout_max_model_len="${SCIWORLD_ROLLOUT_MAX_MODEL_LEN:-32768}"
+rollout_max_num_batched_tokens="${SCIWORLD_ROLLOUT_MAX_NUM_BATCHED_TOKENS:-}"
+rollout_gpu_memory_utilization="${SCIWORLD_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.7}"
 ppo_max_token_len_per_gpu="${SCIWORLD_PPO_MAX_TOKEN_LEN_PER_GPU:-16384}"
 entropy_chunk_size="${SCIWORLD_ENTROPY_CHUNK_SIZE:-256}"
 max_prompt_length="${SCIWORLD_MAX_PROMPT_LENGTH:-1024}"
@@ -75,7 +77,7 @@ echo "[baseline-run] train_gpus=${CUDA_VISIBLE_DEVICES} n_gpus_per_node=${n_gpus
 echo "[baseline-run] rounds=${rounds} train_batch_size=${train_batch_size} rollout_n=${rollout_sample_num}"
 echo "[baseline-run] max_prompt_length=${max_prompt_length} max_response_length=${max_response_length}"
 echo "[baseline-run] use_remove_padding=${use_remove_padding} entropy_chunk_size=${entropy_chunk_size}"
-echo "[baseline-run] gpu_memory_utilization=0.7 max_model_len=${rollout_max_model_len} ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu} max_tokens=${max_tokens} tensor_model_parallel_size=1"
+echo "[baseline-run] gpu_memory_utilization=${rollout_gpu_memory_utilization} max_model_len=${rollout_max_model_len} max_num_batched_tokens=${rollout_max_num_batched_tokens:-default} ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu} max_tokens=${max_tokens} tensor_model_parallel_size=1"
 echo "[baseline-run] env_server_url=${env_server_url}"
 if [ -n "${total_training_steps}" ]; then
   echo "[baseline-run] total_training_steps=${total_training_steps}"
@@ -103,7 +105,7 @@ cmd=(
   "actor_rollout_ref.actor.kl_loss_coef=${kl_coef}"
   actor_rollout_ref.actor.kl_loss_type=low_var_kl
   "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}"
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.7
+  "actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_memory_utilization}"
   "actor_rollout_ref.rollout.n=${rollout_sample_num}"
   "actor_rollout_ref.rollout.max_model_len=${rollout_max_model_len}"
   "actor_rollout_ref.rollout.max_tokens=${max_tokens}"
@@ -127,6 +129,10 @@ cmd=(
 
 if [ -n "${total_training_steps}" ]; then
   cmd+=("trainer.total_training_steps=${total_training_steps}")
+fi
+
+if [ -n "${rollout_max_num_batched_tokens}" ]; then
+  cmd+=("actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens}")
 fi
 
 "${cmd[@]}"

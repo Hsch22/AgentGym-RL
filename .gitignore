@@ -4,6 +4,7 @@ saves/
 models/
 .tmp/
 results/
+wandb/
 
 # Python cache/build artifacts
 __pycache__/
