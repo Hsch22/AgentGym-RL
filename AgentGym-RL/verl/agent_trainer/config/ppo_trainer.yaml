@@ -241,6 +241,20 @@ trainer:
   resume_from_path: False
   test_freq: -1
   test_batches: 1
+  early_stop:
+    enabled: false
+    metric: eval/task_score/mean
+    mode: max
+    min_steps: 0
+    patience: 0
+    min_delta: 0.0
+    max_drop: null
+    hard_min_metric: null
+    min_rollout_valid_ratio: null
+    max_response_length_mean: null
+    max_kl_loss: null
+    max_grad_norm: null
+    save_on_stop: true
   critic_warmup: 0
   default_hdfs_dir: null
   remove_previous_ckpt_in_save: False

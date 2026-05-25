@@ -85,6 +85,18 @@ entropy_chunk_size="${TEXTCRAFT_ENTROPY_CHUNK_SIZE:-256}"
 save_freq="${TEXTCRAFT_SAVE_FREQ:-25}"
 test_freq="${TEXTCRAFT_TEST_FREQ:-35}"
 test_batches="${TEXTCRAFT_TEST_BATCHES:-1}"
+early_stop_enabled="${TEXTCRAFT_EARLY_STOP_ENABLED:-true}"
+early_stop_metric="${TEXTCRAFT_EARLY_STOP_METRIC:-eval/task_score/mean}"
+early_stop_mode="${TEXTCRAFT_EARLY_STOP_MODE:-max}"
+early_stop_min_steps="${TEXTCRAFT_EARLY_STOP_MIN_STEPS:-280}"
+early_stop_patience="${TEXTCRAFT_EARLY_STOP_PATIENCE:-5}"
+early_stop_min_delta="${TEXTCRAFT_EARLY_STOP_MIN_DELTA:-0.005}"
+early_stop_max_drop="${TEXTCRAFT_EARLY_STOP_MAX_DROP:-0.08}"
+early_stop_hard_min_metric="${TEXTCRAFT_EARLY_STOP_HARD_MIN_METRIC:-0.20}"
+early_stop_min_rollout_valid_ratio="${TEXTCRAFT_EARLY_STOP_MIN_ROLLOUT_VALID_RATIO:-0.20}"
+early_stop_max_response_length_mean="${TEXTCRAFT_EARLY_STOP_MAX_RESPONSE_LENGTH_MEAN:-1500}"
+early_stop_max_kl_loss="${TEXTCRAFT_EARLY_STOP_MAX_KL_LOSS:-1.0}"
+early_stop_max_grad_norm="${TEXTCRAFT_EARLY_STOP_MAX_GRAD_NORM:-100000000}"
 rounds_ctrl_type="${TEXTCRAFT_ROUNDS_CTRL_TYPE:-scaling_inter_stepwise}"
 rounds_scaling_inter="${TEXTCRAFT_ROUNDS_SCALING_INTER:-100}"
 rounds_schedule="${TEXTCRAFT_ROUNDS_SCHEDULE:-[10,20,30]}"
@@ -153,6 +165,8 @@ echo "[full-run] g2rl_enabled=${g2rl_enabled} feature_scope=${g2rl_feature_scope
 echo "[full-run] clustering=${clustering_method} enabled=${clustering_enabled} round1=${round1_candidates}/${round1_clusters} later=${later_candidates}/${later_clusters}"
 echo "[full-run] later_cluster_schedule=every:${later_cluster_every},start:${later_cluster_start},until:${later_cluster_until},horizon_min:${later_cluster_horizon_min}"
 echo "[full-run] save_freq=${save_freq} test_freq=${test_freq} test_batches=${test_batches} resume_mode=${resume_mode} tmpdir=${TMPDIR} logs=${model_save_path}"
+echo "[full-run] early_stop enabled=${early_stop_enabled} metric=${early_stop_metric} min_steps=${early_stop_min_steps} patience=${early_stop_patience} min_delta=${early_stop_min_delta} max_drop=${early_stop_max_drop}"
+echo "[full-run] early_stop guards hard_min=${early_stop_hard_min_metric} min_valid=${early_stop_min_rollout_valid_ratio} max_resp_mean=${early_stop_max_response_length_mean} max_kl=${early_stop_max_kl_loss} max_grad=${early_stop_max_grad_norm}"
 if [[ -n "${total_training_steps}" ]]; then
     echo "[full-run] total_training_steps_override=${total_training_steps}"
 fi
@@ -219,6 +233,19 @@ fi
     trainer.save_freq=${save_freq} \
     trainer.test_freq=${test_freq} \
     trainer.test_batches=${test_batches} \
+    trainer.early_stop.enabled=${early_stop_enabled} \
+    trainer.early_stop.metric=${early_stop_metric} \
+    trainer.early_stop.mode=${early_stop_mode} \
+    trainer.early_stop.min_steps=${early_stop_min_steps} \
+    trainer.early_stop.patience=${early_stop_patience} \
+    trainer.early_stop.min_delta=${early_stop_min_delta} \
+    trainer.early_stop.max_drop=${early_stop_max_drop} \
+    trainer.early_stop.hard_min_metric=${early_stop_hard_min_metric} \
+    trainer.early_stop.min_rollout_valid_ratio=${early_stop_min_rollout_valid_ratio} \
+    trainer.early_stop.max_response_length_mean=${early_stop_max_response_length_mean} \
+    trainer.early_stop.max_kl_loss=${early_stop_max_kl_loss} \
+    trainer.early_stop.max_grad_norm=${early_stop_max_grad_norm} \
+    trainer.early_stop.save_on_stop=true \
     trainer.total_epochs=${total_epoches} \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=${n_gpus_per_node} \

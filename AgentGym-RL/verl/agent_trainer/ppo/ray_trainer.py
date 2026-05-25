@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import math
 import random
 import uuid
 from contextlib import contextmanager
@@ -710,6 +711,8 @@ class RayPPOTrainer(object):
         self.epoch_idx = 0
         self.batch_idx_in_epoch = 0
         self._epoch_indices_cache: Optional[tuple[int, list[int]]] = None
+        self.early_stop_best = None
+        self.early_stop_bad_checks = 0
 
         self._validate_config()
         self._create_dataloader()
@@ -1294,6 +1297,143 @@ class RayPPOTrainer(object):
             })
         return metrics
 
+    def _early_stop_config(self):
+        return self.config.trainer.get('early_stop', {})
+
+    def _early_stop_enabled(self):
+        cfg = self._early_stop_config()
+        return bool(cfg.get('enabled', False))
+
+    @staticmethod
+    def _finite_metric(metrics: dict, key: str):
+        value = metrics.get(key, None)
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    def _early_stop_train_guard(self, metrics: dict):
+        if not self._early_stop_enabled():
+            return None
+
+        cfg = self._early_stop_config()
+
+        for key in ('actor/kl_loss', 'actor/grad_norm', 'actor/entropy_loss', 'actor/pg_loss'):
+            if key in metrics:
+                try:
+                    value = float(metrics[key])
+                except (TypeError, ValueError):
+                    return f'non-finite {key}'
+                if not math.isfinite(value):
+                    return f'non-finite {key}'
+
+        min_steps = int(cfg.get('min_steps', 0))
+        if self.global_steps < min_steps:
+            return None
+
+        min_valid_ratio = cfg.get('min_rollout_valid_ratio', None)
+        if min_valid_ratio is not None:
+            min_valid_ratio = float(min_valid_ratio)
+            for key in ('rollout/candidate_string_valid_ratio', 'rollout/taken_string_valid_ratio'):
+                value = self._finite_metric(metrics, key)
+                if value is not None and value < min_valid_ratio:
+                    return f'{key}={value:.4g} < {min_valid_ratio:.4g}'
+
+        max_response_length = cfg.get('max_response_length_mean', None)
+        if max_response_length is not None:
+            value = self._finite_metric(metrics, 'response_length/mean')
+            if value is not None and value > float(max_response_length):
+                return f'response_length/mean={value:.4g} > {float(max_response_length):.4g}'
+
+        max_kl_loss = cfg.get('max_kl_loss', None)
+        if max_kl_loss is not None:
+            value = self._finite_metric(metrics, 'actor/kl_loss')
+            if value is not None and value > float(max_kl_loss):
+                return f'actor/kl_loss={value:.4g} > {float(max_kl_loss):.4g}'
+
+        max_grad_norm = cfg.get('max_grad_norm', None)
+        if max_grad_norm is not None:
+            value = self._finite_metric(metrics, 'actor/grad_norm')
+            if value is not None and value > float(max_grad_norm):
+                return f'actor/grad_norm={value:.4g} > {float(max_grad_norm):.4g}'
+
+        return None
+
+    def _early_stop_eval_guard(self, eval_metrics: dict):
+        if not self._early_stop_enabled() or not eval_metrics:
+            return None, {}
+
+        cfg = self._early_stop_config()
+        metric_key = str(cfg.get('metric', 'eval/task_score/mean'))
+        current = self._finite_metric(eval_metrics, metric_key)
+        if current is None:
+            print(f'[early_stop] skip check: missing/non-finite metric {metric_key}')
+            return None, {}
+
+        mode = str(cfg.get('mode', 'max')).lower()
+        if mode not in ('max', 'min'):
+            raise ValueError(f"trainer.early_stop.mode must be 'max' or 'min', got {mode}")
+
+        min_delta = float(cfg.get('min_delta', 0.0))
+        patience = int(cfg.get('patience', 0))
+        min_steps = int(cfg.get('min_steps', 0))
+
+        if self.early_stop_best is None:
+            self.early_stop_best = current
+            self.early_stop_bad_checks = 0
+            improved = True
+        elif mode == 'max':
+            improved = current > self.early_stop_best + min_delta
+        else:
+            improved = current < self.early_stop_best - min_delta
+
+        if improved:
+            self.early_stop_best = current
+            self.early_stop_bad_checks = 0
+        else:
+            self.early_stop_bad_checks += 1
+
+        log_metrics = {
+            'early_stop/current_metric': current,
+            'early_stop/best_metric': float(self.early_stop_best),
+            'early_stop/bad_checks': float(self.early_stop_bad_checks),
+            'early_stop/should_stop': 0.0,
+        }
+
+        hard_min_metric = cfg.get('hard_min_metric', None)
+        if hard_min_metric is not None and self.global_steps >= min_steps:
+            hard_min_metric = float(hard_min_metric)
+            if mode == 'max' and current < hard_min_metric:
+                log_metrics['early_stop/should_stop'] = 1.0
+                return f'{metric_key}={current:.4g} < hard_min_metric={hard_min_metric:.4g}', log_metrics
+            if mode == 'min' and current > hard_min_metric:
+                log_metrics['early_stop/should_stop'] = 1.0
+                return f'{metric_key}={current:.4g} > hard_min_metric={hard_min_metric:.4g}', log_metrics
+
+        max_drop = cfg.get('max_drop', None)
+        if max_drop is not None and self.global_steps >= min_steps:
+            max_drop = float(max_drop)
+            if mode == 'max' and float(self.early_stop_best) - current > max_drop:
+                log_metrics['early_stop/should_stop'] = 1.0
+                return f'{metric_key} dropped by {float(self.early_stop_best) - current:.4g} > {max_drop:.4g}', log_metrics
+            if mode == 'min' and current - float(self.early_stop_best) > max_drop:
+                log_metrics['early_stop/should_stop'] = 1.0
+                return f'{metric_key} rose by {current - float(self.early_stop_best):.4g} > {max_drop:.4g}', log_metrics
+
+        if patience > 0 and self.global_steps >= min_steps and self.early_stop_bad_checks >= patience:
+            log_metrics['early_stop/should_stop'] = 1.0
+            return (
+                f'{metric_key} did not improve by min_delta={min_delta:.4g} '
+                f'for {self.early_stop_bad_checks} eval checks'
+            ), log_metrics
+
+        return None, log_metrics
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1447,14 +1587,23 @@ class RayPPOTrainer(object):
             metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
+            early_stop_reason = self._early_stop_train_guard(metrics)
+            if early_stop_reason is not None:
+                metrics['early_stop/should_stop'] = 1.0
+
             # TODO: make a canonical logger that supports various backend
             logger.log(data=metrics, step=self.global_steps)
 
-            if self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0:
+            if early_stop_reason is None and self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0:
                 # 注意：eval 走固定 batch 和当前 rollout 配置，不保存训练梯度。
                 eval_metrics = self._run_eval_rollout()
                 if eval_metrics:
+                    early_stop_reason, early_stop_metrics = self._early_stop_eval_guard(eval_metrics)
+                    eval_metrics.update(early_stop_metrics)
                     logger.log(data=eval_metrics, step=self.global_steps)
+
+            if early_stop_reason is not None:
+                print(f'[early_stop] step={self.global_steps}: {early_stop_reason}')
 
             current_step = self.global_steps
             self.completed_steps = current_step
@@ -1466,8 +1615,13 @@ class RayPPOTrainer(object):
                 self.completed_steps % self.config.trainer.save_freq == 0 or
                 self.completed_steps >= self.total_training_steps
             )
+            if early_stop_reason is not None and bool(self._early_stop_config().get('save_on_stop', True)):
+                should_save = True
             if should_save:
                 self._save_checkpoint()
+
+            if early_stop_reason is not None:
+                return
 
             if self.completed_steps >= self.total_training_steps:
                 return
