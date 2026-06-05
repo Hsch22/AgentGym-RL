@@ -112,6 +112,7 @@ class vLLMRollout(BaseRollout):
             disable_log_stats=rollout_config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=rollout_config.enable_chunked_prefill,
+            seed=int(rollout_config.get('seed', 0)),
         )
 
         # vLLM 权重初始化后先下 CPU，降低与 FSDP 参数同步叠加时的显存峰值。
@@ -155,6 +156,16 @@ class vLLMRollout(BaseRollout):
             self.clustering_config is not None
             and getattr(self.clustering_config, 'enabled', False)
         )
+        agentgym_task_name = str(getattr(agentgym_config, "task_name", "") or "").lower()
+        default_action_normalizer = "sciworld" if agentgym_task_name == "sciworld" else "textcraft"
+        configured_action_normalizer = (
+            getattr(self.clustering_config, "action_normalizer", default_action_normalizer)
+            if self.clustering_config is not None
+            else default_action_normalizer
+        )
+        self.clustering_action_normalizer = _clustering.resolve_action_normalizer(
+            configured_action_normalizer
+        )
         self._actor_module_ref = actor_module
         self._gradient_model = None
         if self.clustering_enabled:
@@ -167,7 +178,7 @@ class vLLMRollout(BaseRollout):
             later_cluster_start = int(getattr(self.clustering_config, "later_cluster_start", 1))
             later_cluster_until = int(getattr(self.clustering_config, "later_cluster_until", -1))
             later_cluster_horizon_min = float(getattr(self.clustering_config, "later_cluster_horizon_min", 0.0))
-            if method not in ("gradient", "gradient_multiview", "semantic", "random_valid", "random_raw"):
+            if method not in ("gradient", "gradient_multiview", "g2rl_action_gradient", "g2rl_normalized_action_gradient", "quality_unique_action", "semantic", "random_valid", "random_raw"):
                 raise ValueError(f"unsupported clustering method: {method}")
             assert round1_candidates >= round1_clusters >= 1, (
                 f"invalid round0 clustering config: {round1_candidates=} {round1_clusters=}"
@@ -195,11 +206,12 @@ class vLLMRollout(BaseRollout):
                 f"later={later_candidates}/{later_clusters} "
                 f"later_schedule=every:{later_cluster_every},start:{later_cluster_start},"
                 f"until:{later_cluster_until},horizon_min:{later_cluster_horizon_min} "
+                f"action_normalizer={self.clustering_action_normalizer} "
                 f"feature_topk={int(getattr(self.clustering_config, 'feature_topk', 256))} "
                 f"feature_chunk_size={int(getattr(self.clustering_config, 'feature_chunk_size', 4))}"
             )
-        # gradient/semantic/multiview 聚类需要独立 HF 模型，避免直接调 FSDP actor 时因 rank 提前结束卡住 all_gather。
-        if self.clustering_enabled and self.clustering_config.method in ("gradient", "gradient_multiview", "semantic"):
+        # gradient/semantic/quality 聚类需要独立 HF 模型，避免直接调 FSDP actor 时因 rank 提前结束卡住 all_gather。
+        if self.clustering_enabled and self.clustering_config.method in ("gradient", "gradient_multiview", "g2rl_action_gradient", "g2rl_normalized_action_gradient", "quality_unique_action", "semantic"):
             from transformers import AutoModelForCausalLM
             gradient_model_path = self.clustering_config.gradient_model_path
             self._gradient_model = AutoModelForCausalLM.from_pretrained(
@@ -210,7 +222,7 @@ class vLLMRollout(BaseRollout):
             # 聚类模型常驻 CPU，避免和 vLLM KV cache、FSDP all-gather 同时占显存。
             self._gradient_model.cpu()
             self._gradient_model.eval()
-            # 只有旧 gradient CountSketch 聚类要对参数反传；multiview/semantic 都是 forward-only。
+            # 只有旧 gradient CountSketch 聚类要对参数反传；其余模型打分/embedding 方法都是 forward-only。
             requires_grad = self.clustering_config.method == "gradient"
             for p in self._gradient_model.parameters():
                 p.requires_grad_(requires_grad)
@@ -236,7 +248,7 @@ class vLLMRollout(BaseRollout):
         # === LOCAL CHANGE：将 FSDP actor 权重同步到非 FSDP 聚类模型。 ===
         if not self.clustering_enabled:
             return
-        if self.clustering_config.method not in ("gradient", "gradient_multiview", "semantic"):
+        if self.clustering_config.method not in ("gradient", "gradient_multiview", "g2rl_action_gradient", "g2rl_normalized_action_gradient", "quality_unique_action", "semantic"):
             return
         if self._gradient_model is None:
             return
@@ -267,7 +279,7 @@ class vLLMRollout(BaseRollout):
     def _get_clustering_model(self):
         # === LOCAL CHANGE：集中处理聚类和随机基线的方法选择。 ===
         method = self.clustering_config.method
-        if method in ("gradient", "gradient_multiview", "semantic"):
+        if method in ("gradient", "gradient_multiview", "g2rl_action_gradient", "g2rl_normalized_action_gradient", "quality_unique_action", "semantic"):
             # 聚类前向不走 FSDP，避免不同轨迹早停导致 collective 调用不一致。
             return self._gradient_model
         if method in ("random_valid", "random_raw"):
@@ -350,6 +362,66 @@ class vLLMRollout(BaseRollout):
                     feature_chunk_size=int(getattr(self.clustering_config, "feature_chunk_size", 4)),
                     stats=selection_stats,
                 )
+        if method == "g2rl_action_gradient":
+            with torch.no_grad():
+                return _clustering.select_centers(
+                    method="g2rl_action_gradient",
+                    model=model,
+                    tokenizer=self.tokenizer,
+                    obs_token_ids=obs_token_ids,
+                    response_texts=response_texts,
+                    k=k,
+                    round_idx=round_idx,
+                    max_rounds=max_rounds,
+                    temperature=float(
+                        self.config.get("temperature", 1.0)
+                        if temperature is None
+                        else temperature
+                    ),
+                    feature_topk=int(getattr(self.clustering_config, "feature_topk", 256)),
+                    feature_chunk_size=int(getattr(self.clustering_config, "feature_chunk_size", 4)),
+                    stats=selection_stats,
+                )
+        if method == "g2rl_normalized_action_gradient":
+            with torch.no_grad():
+                return _clustering.select_centers(
+                    method="g2rl_normalized_action_gradient",
+                    model=model,
+                    tokenizer=self.tokenizer,
+                    obs_token_ids=obs_token_ids,
+                    response_texts=response_texts,
+                    k=k,
+                    round_idx=round_idx,
+                    max_rounds=max_rounds,
+                    temperature=float(
+                        self.config.get("temperature", 1.0)
+                        if temperature is None
+                        else temperature
+                    ),
+                    feature_topk=int(getattr(self.clustering_config, "feature_topk", 256)),
+                    feature_chunk_size=int(getattr(self.clustering_config, "feature_chunk_size", 4)),
+                    stats=selection_stats,
+                    action_normalizer=self.clustering_action_normalizer,
+                )
+        if method == "quality_unique_action":
+            with torch.no_grad():
+                return _clustering.select_centers(
+                    method="quality_unique_action",
+                    model=model,
+                    tokenizer=self.tokenizer,
+                    obs_token_ids=obs_token_ids,
+                    response_texts=response_texts,
+                    k=k,
+                    round_idx=round_idx,
+                    max_rounds=max_rounds,
+                    temperature=float(
+                        self.config.get("temperature", 1.0)
+                        if temperature is None
+                        else temperature
+                    ),
+                    feature_chunk_size=int(getattr(self.clustering_config, "feature_chunk_size", 4)),
+                    stats=selection_stats,
+                )
         raise ValueError(f"Unknown clustering method: {method}")
 
     @staticmethod
@@ -376,17 +448,42 @@ class vLLMRollout(BaseRollout):
             bucket_key = f"{bucket}_{key}"
             monitor[bucket_key] = max(monitor.get(bucket_key, 0), value)
 
-    @staticmethod
-    def _parse_action_for_monitor(raw_response):
+    def _parse_valid_action(self, raw_response):
+        return _clustering.parse_valid_action(
+            raw_response,
+            action_normalizer=self.clustering_action_normalizer,
+        )
+
+    def _parse_action_for_monitor(self, raw_response):
         # === LOCAL CHANGE：解析 TextCraft 动作有效性用于 rollout 诊断。 ===
-        normalized = _clustering.parse_valid_action(raw_response)
+        normalized = self._parse_valid_action(raw_response)
         return normalized is not None, normalized or ""
+
+    @staticmethod
+    def _build_normalized_action_texts(action_records, batch_size):
+        # Build one compact behavior string per trajectory for action-level G2RL.
+        # Invalid parser outputs are kept as a fixed token sequence so they do not
+        # become artificially novel because of arbitrary raw response text.
+        per_trajectory = [[] for _ in range(batch_size)]
+        for record in sorted(action_records, key=lambda r: (r["trajectory_index"], r["round"])):
+            trajectory_index = int(record.get("trajectory_index", -1))
+            if trajectory_index < 0 or trajectory_index >= batch_size:
+                continue
+            normalized_action = str(record.get("normalized_action") or "").strip()
+            if bool(record.get("string_valid", False)) and normalized_action:
+                per_trajectory[trajectory_index].append(normalized_action)
+            else:
+                per_trajectory[trajectory_index].append("invalid action")
+        return [
+            "\n".join(actions) if actions else "no action"
+            for actions in per_trajectory
+        ]
 
     def _record_candidate_monitor(self, monitor, round_idx, response_texts):
         # === LOCAL CHANGE：统计采样候选中格式有效的动作字符串。 ===
         valid_count = sum(
             1 for text in response_texts
-            if _clustering.parse_valid_action(text) is not None
+            if self._parse_valid_action(text) is not None
         )
         total = len(response_texts)
         self._monitor_add(monitor, "candidate_total", total, round_idx)
@@ -397,7 +494,7 @@ class vLLMRollout(BaseRollout):
         # === LOCAL CHANGE：统计候选中心里同 normalized Action 的重复与 tokenizer fallback。 ===
         normalized_actions = [
             action
-            for action in (_clustering.parse_valid_action(text) for text in selected_texts)
+            for action in (self._parse_valid_action(text) for text in selected_texts)
             if action is not None
         ]
         duplicate_count = len(normalized_actions) - len(set(normalized_actions))
@@ -414,6 +511,36 @@ class vLLMRollout(BaseRollout):
                 monitor,
                 "multiview_feature_candidates",
                 int(selection_stats.get("multiview_feature_candidates", 0)),
+                round_idx,
+            )
+            self._monitor_add(
+                monitor,
+                "g2rl_action_feature_candidates",
+                int(selection_stats.get("g2rl_action_feature_candidates", 0)),
+                round_idx,
+            )
+            self._monitor_add(
+                monitor,
+                "g2rl_normalized_action_feature_candidates",
+                int(selection_stats.get("g2rl_normalized_action_feature_candidates", 0)),
+                round_idx,
+            )
+            self._monitor_add(
+                monitor,
+                "quality_unique_scored_candidates",
+                int(selection_stats.get("quality_unique_scored_candidates", 0)),
+                round_idx,
+            )
+            self._monitor_add(
+                monitor,
+                "quality_unique_action_count",
+                int(selection_stats.get("quality_unique_action_count", 0)),
+                round_idx,
+            )
+            self._monitor_add(
+                monitor,
+                "quality_unique_duplicate_fill_count",
+                int(selection_stats.get("quality_unique_duplicate_fill_count", 0)),
                 round_idx,
             )
 
@@ -596,7 +723,7 @@ class vLLMRollout(BaseRollout):
                 # 只聚类格式可解析的动作；输入仍用原始 Thought+Action，保留语义差异。
                 valid_indices = [
                     i for i, t in enumerate(all_response_texts)
-                    if _clustering.parse_valid_action(t) is not None
+                    if self._parse_valid_action(t) is not None
                 ]
                 valid_texts = [all_response_texts[i] for i in valid_indices]
 
@@ -743,7 +870,7 @@ class vLLMRollout(BaseRollout):
             else:
                 valid_indices = [
                     i for i, t in enumerate(all_response_texts)
-                    if _clustering.parse_valid_action(t) is not None
+                    if self._parse_valid_action(t) is not None
                 ]
                 valid_texts = [all_response_texts[i] for i in valid_indices]
 
@@ -1105,7 +1232,7 @@ class vLLMRollout(BaseRollout):
             rollout_bar.close()
             rollout_bar = None
             response_ids, response_attention_mask, response_position_ids, response_loss_mask = [], [], [], []
-            scores, messages = [], []
+            scores, successes, messages = [], [], []
             
             for rollout_handler in rollout_handler_ls:
                 # check length
@@ -1119,6 +1246,7 @@ class vLLMRollout(BaseRollout):
                 response_position_ids.append(torch.tensor(rollout_handler.response_position_ids, dtype=torch.int, device=cur_device))
                 response_loss_mask.append(torch.tensor(rollout_handler.response_loss_mask, dtype=torch.int, device=cur_device))
                 scores.append(rollout_handler.score)
+                successes.append(float(bool(rollout_handler.done) and float(rollout_handler.score) > 0.0))
                 messages.append(rollout_handler.messages)
             
             # pad to length
@@ -1153,6 +1281,7 @@ class vLLMRollout(BaseRollout):
             valid_response_length = attention_mask[:, prompt_length:].sum(dim=-1)
             for i in range(len(scores)):
                 reward_tensor[i, valid_response_length[i].item() - 1] = scores[i]
+            normalized_action_texts = self._build_normalized_action_texts(action_records, batch_size)
 
             if global_steps and self.config.rollout_log_dir:
                 try:
@@ -1202,7 +1331,8 @@ class vLLMRollout(BaseRollout):
                 'response_mask': response_mask,
                 'scores': reward_tensor,
                 'task_rounds': torch.tensor(task_rounds, dtype=torch.float32).to(input_ids.device),
-                'task_scores': reward_tensor
+                'task_scores': reward_tensor,
+                'task_successes': torch.tensor(successes, dtype=torch.float32, device=input_ids.device),
             },
             batch_size=batch_size)
         
@@ -1213,5 +1343,8 @@ class vLLMRollout(BaseRollout):
         return DataProto(
             batch=batch,
             # 额外返回 rollout_monitor，训练侧聚合后会删除，不进入 actor 更新。
-            non_tensor_batch={"rollout_monitor": np.array(rollout_monitors, dtype=object)},
+            non_tensor_batch={
+                "rollout_monitor": np.array(rollout_monitors, dtype=object),
+                "g2rl_normalized_action_texts": np.array(normalized_action_texts, dtype=object),
+            },
         )

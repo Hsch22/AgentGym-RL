@@ -88,7 +88,7 @@ test_batches="${TEXTCRAFT_TEST_BATCHES:-1}"
 early_stop_enabled="${TEXTCRAFT_EARLY_STOP_ENABLED:-true}"
 early_stop_metric="${TEXTCRAFT_EARLY_STOP_METRIC:-eval/task_score/mean}"
 early_stop_mode="${TEXTCRAFT_EARLY_STOP_MODE:-max}"
-early_stop_min_steps="${TEXTCRAFT_EARLY_STOP_MIN_STEPS:-280}"
+early_stop_min_steps="${TEXTCRAFT_EARLY_STOP_MIN_STEPS:-100}"
 early_stop_patience="${TEXTCRAFT_EARLY_STOP_PATIENCE:-5}"
 early_stop_min_delta="${TEXTCRAFT_EARLY_STOP_MIN_DELTA:-0.005}"
 early_stop_max_drop="${TEXTCRAFT_EARLY_STOP_MAX_DROP:-0.08}"
@@ -106,24 +106,30 @@ export VERL_ENTROPY_CHUNK_SIZE="${entropy_chunk_size}"
 # Default run keeps rollout sampling identical to the ScalingInter baseline and
 # applies G2RL only before GRPO advantage computation.
 g2rl_enabled="${TEXTCRAFT_G2RL_ENABLED:-true}"
-g2rl_feature_scope="${TEXTCRAFT_G2RL_FEATURE_SCOPE:-action}"
+g2rl_feature_scope="${TEXTCRAFT_G2RL_FEATURE_SCOPE:-normalized_action}"
 g2rl_lambda_coef="${TEXTCRAFT_G2RL_LAMBDA_COEF:-1.0}"
 g2rl_reward_clip="${TEXTCRAFT_G2RL_REWARD_CLIP:-3.0}"
 g2rl_zero_one_to_signed="${TEXTCRAFT_G2RL_ZERO_ONE_TO_SIGNED:-true}"
 g2rl_normalize_novelty="${TEXTCRAFT_G2RL_NORMALIZE_NOVELTY:-true}"
 g2rl_feature_topk="${TEXTCRAFT_G2RL_FEATURE_TOPK:-256}"
 g2rl_token_chunk_size="${TEXTCRAFT_G2RL_TOKEN_CHUNK_SIZE:-512}"
+g2rl_stop_after_steps="${TEXTCRAFT_G2RL_STOP_AFTER_STEPS:-70}"
+g2rl_novelty_dtype="${TEXTCRAFT_G2RL_NOVELTY_DTYPE:-float64}"
+g2rl_skip_all_failed_groups="${TEXTCRAFT_G2RL_SKIP_ALL_FAILED_GROUPS:-false}"
+g2rl_success_only_novelty="${TEXTCRAFT_G2RL_SUCCESS_ONLY_NOVELTY:-false}"
 
 # ==== optional rollout-time clustering ====
 # Keep disabled for the paper-style G2RL run. Enable explicitly when testing
 # selection-based exploration on top of reward shaping.
 clustering_enabled="${TEXTCRAFT_CLUSTERING_ENABLED:-false}"
-clustering_method="${TEXTCRAFT_CLUSTERING_METHOD:-gradient_multiview}"   # "gradient", "gradient_multiview", "semantic", "random_valid", or "random_raw"
-round1_candidates="${TEXTCRAFT_ROUND1_CANDIDATES:-64}"
+clustering_method="${TEXTCRAFT_CLUSTERING_METHOD:-gradient_multiview}"   # "gradient", "gradient_multiview", "g2rl_action_gradient", "g2rl_normalized_action_gradient", "quality_unique_action", "semantic", "random_valid", or "random_raw"
+# Keep clustering defaults realistic: round0 costs 2x versus vanilla rollout.n=8,
+# and later-round candidate clustering stays off unless explicitly enabled.
+round1_candidates="${TEXTCRAFT_ROUND1_CANDIDATES:-16}"
 round1_clusters="${TEXTCRAFT_ROUND1_CLUSTERS:-8}"
-later_candidates="${TEXTCRAFT_LATER_CANDIDATES:-16}"
-later_clusters="${TEXTCRAFT_LATER_CLUSTERS:-4}"
-later_cluster_every="${TEXTCRAFT_LATER_CLUSTER_EVERY:-2}"
+later_candidates="${TEXTCRAFT_LATER_CANDIDATES:-4}"
+later_clusters="${TEXTCRAFT_LATER_CLUSTERS:-1}"
+later_cluster_every="${TEXTCRAFT_LATER_CLUSTER_EVERY:-0}"
 later_cluster_start="${TEXTCRAFT_LATER_CLUSTER_START:-1}"
 later_cluster_until="${TEXTCRAFT_LATER_CLUSTER_UNTIL:--1}"
 later_cluster_horizon_min="${TEXTCRAFT_LATER_CLUSTER_HORIZON_MIN:-0.25}"
@@ -134,7 +140,7 @@ gradient_model_path=${agent_model_path}
 
 model_save_dir="${TEXTCRAFT_MODEL_SAVE_DIR:-saves}"
 mkdir -p "${model_save_dir}"
-default_exp_name="textcraft_paper_g2rl_action_feature_no_cluster_scalinginter_2xh200"
+default_exp_name="textcraft_paper_g2rl_normalized_action_feature_no_cluster_scalinginter_2xh200"
 if [[ -n "${TEXTCRAFT_MODEL_SAVE_PATH:-}" ]]; then
     model_save_path="${TEXTCRAFT_MODEL_SAVE_PATH}"
     exp_name="${TEXTCRAFT_EXP_NAME:-$(basename "${model_save_path}")}"
@@ -161,7 +167,7 @@ echo "[full-run] total_trajectories_per_step=$((train_batch_size * rollout_sampl
 echo "[full-run] ppo_mini_batch_size=${ppo_mini_batch_size} ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}"
 echo "[full-run] max_prompt_length=${max_prompt_length} max_response_length=${max_response_length} rollout_max_model_len=${rollout_max_model_len} rollout_max_num_batched_tokens=${rollout_max_num_batched_tokens} rollout_max_tokens=${rollout_max_tokens}"
 echo "[full-run] use_remove_padding=${use_remove_padding} entropy_chunk_size=${entropy_chunk_size} rollout_gpu_memory_utilization=${rollout_gpu_memory_utilization}"
-echo "[full-run] g2rl_enabled=${g2rl_enabled} feature_scope=${g2rl_feature_scope} lambda=${g2rl_lambda_coef} reward_clip=${g2rl_reward_clip} zero_one_to_signed=${g2rl_zero_one_to_signed} feature_topk=${g2rl_feature_topk} token_chunk_size=${g2rl_token_chunk_size}"
+echo "[full-run] g2rl_enabled=${g2rl_enabled} feature_scope=${g2rl_feature_scope} lambda=${g2rl_lambda_coef} reward_clip=${g2rl_reward_clip} zero_one_to_signed=${g2rl_zero_one_to_signed} feature_topk=${g2rl_feature_topk} token_chunk_size=${g2rl_token_chunk_size} g2rl_stop_after_steps=${g2rl_stop_after_steps} novelty_dtype=${g2rl_novelty_dtype} skip_all_failed_groups=${g2rl_skip_all_failed_groups} success_only_novelty=${g2rl_success_only_novelty}"
 echo "[full-run] clustering=${clustering_method} enabled=${clustering_enabled} round1=${round1_candidates}/${round1_clusters} later=${later_candidates}/${later_clusters}"
 echo "[full-run] later_cluster_schedule=every:${later_cluster_every},start:${later_cluster_start},until:${later_cluster_until},horizon_min:${later_cluster_horizon_min}"
 echo "[full-run] save_freq=${save_freq} test_freq=${test_freq} test_batches=${test_batches} resume_mode=${resume_mode} tmpdir=${TMPDIR} logs=${model_save_path}"
@@ -184,6 +190,10 @@ fi
     algorithm.g2rl.normalize_novelty=${g2rl_normalize_novelty} \
     algorithm.g2rl.feature_topk=${g2rl_feature_topk} \
     algorithm.g2rl.token_chunk_size=${g2rl_token_chunk_size} \
+    algorithm.g2rl.stop_after_steps=${g2rl_stop_after_steps} \
+    algorithm.g2rl.novelty_dtype=${g2rl_novelty_dtype} \
+    algorithm.g2rl.skip_all_failed_groups=${g2rl_skip_all_failed_groups} \
+    algorithm.g2rl.success_only_novelty=${g2rl_success_only_novelty} \
     data.train_file=AgentItemId/${task_name}_train.json \
     data.val_files=AgentEval/textcraft/eval/textcraft_test.json \
     data.train_batch_size=${train_batch_size} \
@@ -194,6 +204,8 @@ fi
     actor_rollout_ref.agentgym.env_addr=${env_server_url} \
     actor_rollout_ref.agentgym.timeout=600 \
     actor_rollout_ref.model.path=${agent_model_path} \
+    critic.model.path=${agent_model_path} \
+    critic.model.tokenizer_path=${agent_model_path} \
     actor_rollout_ref.model.use_remove_padding=${use_remove_padding} \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \

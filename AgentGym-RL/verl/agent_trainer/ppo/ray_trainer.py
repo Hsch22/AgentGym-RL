@@ -431,6 +431,53 @@ def drop_rollout_monitor(data: DataProto):
     data.non_tensor_batch.pop(ROLLOUT_MONITOR_KEY, None)
 
 
+def _parse_g2rl_stop_after_steps(g2rl_config):
+    stop_after_steps = g2rl_config.get('stop_after_steps', None)
+    if stop_after_steps is None:
+        return None
+    if isinstance(stop_after_steps, str):
+        normalized = stop_after_steps.strip().lower()
+        if normalized in ('', 'none', 'null'):
+            return None
+        try:
+            return int(normalized)
+        except ValueError as exc:
+            raise ValueError(
+                f"algorithm.g2rl.stop_after_steps must be null or an integer, got {stop_after_steps!r}"
+            ) from exc
+    if isinstance(stop_after_steps, bool):
+        raise ValueError(f"algorithm.g2rl.stop_after_steps must be null or an integer, got {stop_after_steps!r}")
+    if isinstance(stop_after_steps, float) and not stop_after_steps.is_integer():
+        raise ValueError(f"algorithm.g2rl.stop_after_steps must be null or an integer, got {stop_after_steps!r}")
+    try:
+        return int(stop_after_steps)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"algorithm.g2rl.stop_after_steps must be null or an integer, got {stop_after_steps!r}"
+        ) from exc
+
+
+def is_g2rl_active(g2rl_config, global_steps: int) -> bool:
+    if not bool(g2rl_config.get('enabled', False)):
+        return False
+    stop_after_steps = _parse_g2rl_stop_after_steps(g2rl_config)
+    return stop_after_steps is None or stop_after_steps <= 0 or int(global_steps) <= stop_after_steps
+
+
+def _g2rl_stop_after_steps_metric(g2rl_config) -> float:
+    stop_after_steps = _parse_g2rl_stop_after_steps(g2rl_config)
+    return float(stop_after_steps) if stop_after_steps is not None else 0.0
+
+
+def get_g2rl_novelty_torch_dtype(g2rl_config):
+    novelty_dtype = str(g2rl_config.get('novelty_dtype', 'float64')).strip().lower()
+    if novelty_dtype == 'float32':
+        return torch.float32
+    if novelty_dtype == 'float64':
+        return torch.float64
+    raise ValueError(f"algorithm.g2rl.novelty_dtype must be 'float32' or 'float64', got {novelty_dtype!r}")
+
+
 def apply_g2rl_reward_shaping(data: DataProto, g2rl_config):
     """Apply paper-style G2RL trajectory reward shaping before GRPO standardization."""
     if 'g2rl_features' not in data.batch.keys():
@@ -439,10 +486,11 @@ def apply_g2rl_reward_shaping(data: DataProto, g2rl_config):
     token_level_rewards = data.batch['token_level_rewards']
     token_level_scores = data.batch['token_level_scores']
     response_mask = data.batch['response_mask']
-    features = data.batch.pop('g2rl_features').float()
+    features = data.batch.pop('g2rl_features')
     index = data.non_tensor_batch['uid']
 
     device = token_level_rewards.device
+    novelty_torch_dtype = get_g2rl_novelty_torch_dtype(g2rl_config)
     base_scores = token_level_scores.sum(dim=-1).float()
     if bool(g2rl_config.get('zero_one_to_signed', True)):
         signed_scores = base_scores * 2.0 - 1.0
@@ -452,11 +500,18 @@ def apply_g2rl_reward_shaping(data: DataProto, g2rl_config):
     lambda_coef = float(g2rl_config.get('lambda_coef', 1.0))
     reward_clip = float(g2rl_config.get('reward_clip', 3.0))
     eps = float(g2rl_config.get('eps', 1e-6))
+    skip_all_failed_groups = bool(g2rl_config.get('skip_all_failed_groups', False))
+    success_only_novelty = bool(g2rl_config.get('success_only_novelty', False))
+    success_mask = base_scores > 0.0
 
     shaped_scores = signed_scores.clone()
     novelty_scores = torch.zeros_like(signed_scores)
     factor_scores = torch.ones_like(signed_scores)
     group_sizes = []
+    skipped_all_failed_group_count = 0
+    shaped_group_count = 0
+    shaped_success_only_count = 0
+    shaped_row_count = 0
 
     id2indices = {}
     for row_idx, uid in enumerate(index):
@@ -464,11 +519,31 @@ def apply_g2rl_reward_shaping(data: DataProto, g2rl_config):
 
     with torch.no_grad():
         for row_indices in id2indices.values():
-            if len(row_indices) <= 1:
+            all_group_idx = torch.tensor(row_indices, dtype=torch.long, device=device)
+            group_success = success_mask.index_select(0, all_group_idx)
+            success_count = int(group_success.sum().item())
+
+            if skip_all_failed_groups and success_count == 0:
+                skipped_all_failed_group_count += 1
                 continue
-            group_idx = torch.tensor(row_indices, dtype=torch.long, device=device)
-            group_features = features.index_select(0, group_idx).to(device=device, dtype=torch.float32)
-            group_signed = signed_scores.index_select(0, group_idx)
+
+            if (skip_all_failed_groups or success_only_novelty) and success_count < 2:
+                continue
+
+            selected_indices = row_indices
+            if success_only_novelty:
+                group_success_list = group_success.detach().cpu().tolist()
+                selected_indices = [
+                    row_idx for row_idx, is_success in zip(row_indices, group_success_list) if is_success
+                ]
+
+            if len(selected_indices) <= 1:
+                continue
+
+            group_idx = torch.tensor(selected_indices, dtype=torch.long, device=device)
+            feature_idx = torch.tensor(selected_indices, dtype=torch.long, device=features.device)
+            group_features = features.index_select(0, feature_idx).to(device=device, dtype=novelty_torch_dtype)
+            group_signed = signed_scores.index_select(0, group_idx).to(dtype=novelty_torch_dtype)
 
             norms = torch.linalg.vector_norm(group_features, dim=-1, keepdim=True).clamp_min(eps)
             unit_features = group_features / norms
@@ -476,8 +551,8 @@ def apply_g2rl_reward_shaping(data: DataProto, g2rl_config):
             sim_sq = similarities.square()
 
             group_novelty = []
-            for local_i in range(len(row_indices)):
-                mask = torch.ones(len(row_indices), dtype=torch.bool, device=device)
+            for local_i in range(len(selected_indices)):
+                mask = torch.ones(len(selected_indices), dtype=torch.bool, device=device)
                 mask[local_i] = False
                 weights = torch.softmax(group_signed[mask], dim=0)
                 explained = torch.sum(weights * sim_sq[local_i, mask])
@@ -498,10 +573,14 @@ def apply_g2rl_reward_shaping(data: DataProto, g2rl_config):
             factors = 1.0 + lambda_coef * normalized_novelty
             group_shaped = torch.clamp(group_signed * factors, min=-reward_clip, max=reward_clip)
 
-            shaped_scores.index_copy_(0, group_idx, group_shaped)
-            novelty_scores.index_copy_(0, group_idx, group_novelty)
-            factor_scores.index_copy_(0, group_idx, factors)
-            group_sizes.append(float(len(row_indices)))
+            shaped_scores.index_copy_(0, group_idx, group_shaped.to(dtype=shaped_scores.dtype))
+            novelty_scores.index_copy_(0, group_idx, group_novelty.to(dtype=novelty_scores.dtype))
+            factor_scores.index_copy_(0, group_idx, factors.to(dtype=factor_scores.dtype))
+            group_sizes.append(float(len(selected_indices)))
+            shaped_group_count += 1
+            shaped_row_count += len(selected_indices)
+            if success_only_novelty:
+                shaped_success_only_count += 1
 
     dense_adjustment = token_level_rewards - token_level_scores
     shaped_outcome = torch.zeros_like(token_level_rewards)
@@ -512,6 +591,8 @@ def apply_g2rl_reward_shaping(data: DataProto, g2rl_config):
 
     metrics = {
         'g2rl/enabled': 1.0,
+        'g2rl/active': 1.0,
+        'g2rl/stop_after_steps': _g2rl_stop_after_steps_metric(g2rl_config),
         'g2rl/base_signed_reward_mean': torch.mean(signed_scores).detach().item(),
         'g2rl/shaped_reward_mean': torch.mean(shaped_scores).detach().item(),
         'g2rl/shaped_reward_max': torch.max(shaped_scores).detach().item(),
@@ -522,6 +603,11 @@ def apply_g2rl_reward_shaping(data: DataProto, g2rl_config):
         'g2rl/factor_mean': torch.mean(factor_scores).detach().item(),
         'g2rl/clipfrac': torch.mean((torch.abs(shaped_scores) >= reward_clip).float()).detach().item(),
         'g2rl/group_size_mean': float(np.mean(group_sizes)) if group_sizes else 1.0,
+        'g2rl/skipped_all_failed_group_count': float(skipped_all_failed_group_count),
+        'g2rl/shaped_group_count': float(shaped_group_count),
+        'g2rl/shaped_success_only_count': float(shaped_success_only_count),
+        'g2rl/shaped_row_ratio': float(shaped_row_count) / max(float(signed_scores.numel()), 1.0),
+        'g2rl/success_row_ratio': torch.mean(success_mask.float()).detach().item(),
     }
     return data, metrics
 
@@ -789,6 +875,11 @@ class RayPPOTrainer(object):
                 assert config.critic.model.use_remove_padding, \
                     "When using sequence parallelism for critic, you must enable `use_remove_padding`."
 
+        g2rl_config = config.algorithm.get('g2rl', None)
+        if g2rl_config is not None:
+            _parse_g2rl_stop_after_steps(g2rl_config)
+            get_g2rl_novelty_torch_dtype(g2rl_config)
+
         print("[validate_config] All configuration checks passed successfully!")
 
     def _create_dataloader(self):
@@ -1047,7 +1138,6 @@ class RayPPOTrainer(object):
             'completed_steps': expected_completed_steps,
             'global_steps': expected_completed_steps,
             'steps_per_epoch': self.steps_per_epoch,
-            'total_training_steps': self.total_training_steps,
             'dataset_len': self.train_dataset_len,
             'data_seed': self.data_seed,
             'shuffle': bool(self.config.data.shuffle),
@@ -1062,6 +1152,27 @@ class RayPPOTrainer(object):
                     f"Cannot strictly resume {global_step_folder}: {key} mismatch "
                     f"(checkpoint={actual}, current={expected})"
                 )
+
+        checkpoint_total_steps = state.get('total_training_steps')
+        if checkpoint_total_steps != self.total_training_steps:
+            allow_extend = bool(self.config.trainer.get('resume_allow_extend_total_training_steps', False))
+            try:
+                checkpoint_total_steps_int = int(checkpoint_total_steps)
+            except (TypeError, ValueError):
+                checkpoint_total_steps_int = None
+            if (
+                not allow_extend
+                or checkpoint_total_steps_int is None
+                or checkpoint_total_steps_int > int(self.total_training_steps)
+            ):
+                raise ValueError(
+                    f"Cannot strictly resume {global_step_folder}: total_training_steps mismatch "
+                    f"(checkpoint={checkpoint_total_steps}, current={self.total_training_steps})"
+                )
+            print(
+                f"Extending resumed run total_training_steps from "
+                f"{checkpoint_total_steps} to {self.total_training_steps}"
+            )
 
         expected_cursor = cursor_from_completed_steps(expected_completed_steps, self.steps_per_epoch)
         if int(state.get('epoch_idx', -1)) != expected_cursor.epoch_idx or \
@@ -1281,12 +1392,19 @@ class RayPPOTrainer(object):
             drop_rollout_monitor(gen_batch_output)
 
             task_scores = gen_batch_output.batch["task_scores"].sum(-1)
+            if "task_successes" in gen_batch_output.batch.keys():
+                task_successes = gen_batch_output.batch["task_successes"].float()
+            else:
+                task_successes = (task_scores > 0).float()
             task_rounds = gen_batch_output.batch["task_rounds"]
             response_length = gen_batch_output.batch["response_mask"].sum(-1).float()
             metrics.update({
                 f"{batch_prefix}/task_score/mean": torch.mean(task_scores).detach().item(),
                 f"{batch_prefix}/task_score/max": torch.max(task_scores).detach().item(),
                 f"{batch_prefix}/task_score/min": torch.min(task_scores).detach().item(),
+                f"{batch_prefix}/task_success/mean": torch.mean(task_successes).detach().item(),
+                f"{batch_prefix}/pass_at_1": torch.mean(task_successes).detach().item(),
+                f"{batch_prefix}/score_positive_at_1": torch.mean((task_scores > 0).float()).detach().item(),
                 f"{batch_prefix}/task_round/mean": torch.mean(task_rounds).detach().item(),
                 f"{batch_prefix}/task_round/max": torch.max(task_rounds).detach().item(),
                 f"{batch_prefix}/task_round/min": torch.min(task_rounds).detach().item(),
@@ -1529,13 +1647,21 @@ class RayPPOTrainer(object):
                         ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                         batch = batch.union(ref_log_prob)
 
-                if bool(self.config.algorithm.g2rl.get('enabled', False)):
+                g2rl_config = self.config.algorithm.g2rl
+                g2rl_active = is_g2rl_active(g2rl_config, self.global_steps)
+                if g2rl_active:
                     with _timer('g2rl_feature', timing_raw):
-                        batch.meta_info['g2rl_feature_scope'] = str(self.config.algorithm.g2rl.get('feature_scope', 'response'))
-                        batch.meta_info['g2rl_feature_topk'] = int(self.config.algorithm.g2rl.get('feature_topk', 256))
-                        batch.meta_info['g2rl_token_chunk_size'] = int(self.config.algorithm.g2rl.get('token_chunk_size', 256))
+                        batch.meta_info['g2rl_feature_scope'] = str(g2rl_config.get('feature_scope', 'response'))
+                        batch.meta_info['g2rl_feature_topk'] = int(g2rl_config.get('feature_topk', 256))
+                        batch.meta_info['g2rl_token_chunk_size'] = int(g2rl_config.get('token_chunk_size', 256))
                         g2rl_features = self.actor_rollout_wg.compute_g2rl_features(batch)
                         batch = batch.union(g2rl_features)
+                elif bool(g2rl_config.get('enabled', False)):
+                    metrics.update({
+                        'g2rl/active': 0.0,
+                        'g2rl/skipped_after_stop': 1.0,
+                        'g2rl/stop_after_steps': _g2rl_stop_after_steps_metric(g2rl_config),
+                    })
 
                 # compute values
                 if self.use_critic:
@@ -1557,8 +1683,8 @@ class RayPPOTrainer(object):
                     else:
                         batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
-                    if bool(self.config.algorithm.g2rl.get('enabled', False)):
-                        batch, g2rl_metrics = apply_g2rl_reward_shaping(batch, self.config.algorithm.g2rl)
+                    if g2rl_active:
+                        batch, g2rl_metrics = apply_g2rl_reward_shaping(batch, g2rl_config)
                         metrics.update(g2rl_metrics)
 
                     # compute advantages, executed on the driver process

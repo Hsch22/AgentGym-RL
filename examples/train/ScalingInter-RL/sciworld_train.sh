@@ -22,6 +22,7 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=1800
 export NCCL_DEBUG=WARN
 export NCCL_DEBUG_SUBSYS=COLL
+export RAY_memory_usage_threshold="${SCIWORLD_RAY_MEMORY_USAGE_THRESHOLD:-0.99}"
 export WANDB_MODE=offline
 
 task_name="sciworld"
@@ -63,12 +64,41 @@ steps_scaling_inter="${SCIWORLD_STEPS_SCALING_INTER:-100}"
 total_epoches="${SCIWORLD_TOTAL_EPOCHS:-10}"
 save_freq="${SCIWORLD_SAVE_FREQ:-25}"
 total_training_steps="${SCIWORLD_TOTAL_TRAINING_STEPS:-}"
+resume_mode="${SCIWORLD_RESUME_MODE:-auto}"
+resume_allow_extend_total_training_steps="${SCIWORLD_RESUME_ALLOW_EXTEND_TOTAL_TRAINING_STEPS:-false}"
+data_seed="${SCIWORLD_DATA_SEED:-1}"
+rollout_seed="${SCIWORLD_ROLLOUT_SEED:-0}"
 
-model_save_dir="saves"
+clustering_enabled="${SCIWORLD_CLUSTERING_ENABLED:-false}"
+clustering_method="${SCIWORLD_CLUSTERING_METHOD:-g2rl_normalized_action_gradient}"
+clustering_action_normalizer="${SCIWORLD_CLUSTERING_ACTION_NORMALIZER:-sciworld}"
+clustering_round1_candidates="${SCIWORLD_ROUND1_CANDIDATES:-16}"
+clustering_round1_clusters="${SCIWORLD_ROUND1_CLUSTERS:-${rollout_sample_num}}"
+clustering_later_candidates="${SCIWORLD_LATER_CANDIDATES:-4}"
+clustering_later_clusters="${SCIWORLD_LATER_CLUSTERS:-1}"
+clustering_later_every="${SCIWORLD_LATER_CLUSTER_EVERY:-0}"
+clustering_later_start="${SCIWORLD_LATER_CLUSTER_START:-1}"
+clustering_later_until="${SCIWORLD_LATER_CLUSTER_UNTIL:--1}"
+clustering_later_horizon_min="${SCIWORLD_LATER_CLUSTER_HORIZON_MIN:-0.25}"
+clustering_gradient_d_proj="${SCIWORLD_GRADIENT_D_PROJ:-512}"
+clustering_feature_topk="${SCIWORLD_CLUSTER_FEATURE_TOPK:-256}"
+clustering_feature_chunk_size="${SCIWORLD_CLUSTER_FEATURE_CHUNK_SIZE:-4}"
+clustering_gradient_model_path="${SCIWORLD_GRADIENT_MODEL_PATH:-${agent_model_path}}"
+
+model_save_dir="${SCIWORLD_MODEL_SAVE_DIR:-saves}"
 mkdir -p "${model_save_dir}"
 exp_name_prefix="${SCIWORLD_EXP_PREFIX:-sciworld_scalinginter_baseline_3b}"
-exp_name="${exp_name_prefix}_$(date +%Y%m%d_%H%M)"
-model_save_path="${model_save_dir}/${exp_name}"
+if [ -n "${SCIWORLD_EXP_NAME:-}" ]; then
+  exp_name="${SCIWORLD_EXP_NAME}"
+else
+  exp_name="${exp_name_prefix}_$(date +%Y%m%d_%H%M)"
+fi
+if [ -n "${SCIWORLD_MODEL_SAVE_PATH:-}" ]; then
+  model_save_path="${SCIWORLD_MODEL_SAVE_PATH}"
+  exp_name="${SCIWORLD_EXP_NAME:-$(basename "${model_save_path}")}"
+else
+  model_save_path="${model_save_dir}/${exp_name}"
+fi
 
 mkdir -p "${model_save_path}"
 
@@ -78,7 +108,11 @@ echo "[baseline-run] rounds=${rounds} train_batch_size=${train_batch_size} rollo
 echo "[baseline-run] max_prompt_length=${max_prompt_length} max_response_length=${max_response_length}"
 echo "[baseline-run] use_remove_padding=${use_remove_padding} entropy_chunk_size=${entropy_chunk_size}"
 echo "[baseline-run] gpu_memory_utilization=${rollout_gpu_memory_utilization} max_model_len=${rollout_max_model_len} max_num_batched_tokens=${rollout_max_num_batched_tokens:-default} ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu} max_tokens=${max_tokens} tensor_model_parallel_size=1"
+echo "[baseline-run] RAY_memory_usage_threshold=${RAY_memory_usage_threshold}"
 echo "[baseline-run] env_server_url=${env_server_url}"
+echo "[baseline-run] data_seed=${data_seed} rollout_seed=${rollout_seed}"
+echo "[baseline-run] clustering_enabled=${clustering_enabled} method=${clustering_method} action_normalizer=${clustering_action_normalizer}"
+echo "[baseline-run] resume_mode=${resume_mode} resume_allow_extend_total_training_steps=${resume_allow_extend_total_training_steps}"
 if [ -n "${total_training_steps}" ]; then
   echo "[baseline-run] total_training_steps=${total_training_steps}"
 fi
@@ -93,6 +127,7 @@ cmd=(
   "algorithm.rounds_ctrl.steps_scaling_inter=${steps_scaling_inter}"
   "algorithm.rounds_ctrl.rounds=${rounds}"
   "data.train_file=AgentItemId/${task_name}_train.json"
+  "data.seed=${data_seed}"
   "data.train_batch_size=${train_batch_size}"
   "data.max_prompt_length=${max_prompt_length}"
   "data.max_response_length=${max_response_length}"
@@ -109,6 +144,7 @@ cmd=(
   "actor_rollout_ref.rollout.n=${rollout_sample_num}"
   "actor_rollout_ref.rollout.max_model_len=${rollout_max_model_len}"
   "actor_rollout_ref.rollout.max_tokens=${max_tokens}"
+  "actor_rollout_ref.rollout.seed=${rollout_seed}"
   actor_rollout_ref.rollout.tensor_model_parallel_size=1
   "actor_rollout_ref.actor.ppo_epochs=${ppo_inner_epochs}"
   "actor_rollout_ref.actor.optim.lr=${policy_learning_rate}"
@@ -121,6 +157,8 @@ cmd=(
   trainer.project_name=agentgym-rl-baseline
   "trainer.experiment_name=${exp_name}"
   "trainer.save_freq=${save_freq}"
+  "trainer.resume_mode=${resume_mode}"
+  "trainer.resume_allow_extend_total_training_steps=${resume_allow_extend_total_training_steps}"
   "trainer.total_epochs=${total_epoches}"
   trainer.nnodes=1
   "trainer.n_gpus_per_node=${n_gpus_per_node}"
@@ -133,6 +171,26 @@ fi
 
 if [ -n "${rollout_max_num_batched_tokens}" ]; then
   cmd+=("actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens}")
+fi
+
+if [[ "${clustering_enabled}" == "true" || "${clustering_enabled}" == "1" ]]; then
+  cmd+=(
+    actor_rollout_ref.rollout.clustering.enabled=true
+    "actor_rollout_ref.rollout.clustering.method=${clustering_method}"
+    "actor_rollout_ref.rollout.clustering.action_normalizer=${clustering_action_normalizer}"
+    "actor_rollout_ref.rollout.clustering.round1_candidates=${clustering_round1_candidates}"
+    "actor_rollout_ref.rollout.clustering.round1_clusters=${clustering_round1_clusters}"
+    "actor_rollout_ref.rollout.clustering.later_candidates=${clustering_later_candidates}"
+    "actor_rollout_ref.rollout.clustering.later_clusters=${clustering_later_clusters}"
+    "actor_rollout_ref.rollout.clustering.later_cluster_every=${clustering_later_every}"
+    "actor_rollout_ref.rollout.clustering.later_cluster_start=${clustering_later_start}"
+    "actor_rollout_ref.rollout.clustering.later_cluster_until=${clustering_later_until}"
+    "actor_rollout_ref.rollout.clustering.later_cluster_horizon_min=${clustering_later_horizon_min}"
+    "actor_rollout_ref.rollout.clustering.gradient_d_proj=${clustering_gradient_d_proj}"
+    "actor_rollout_ref.rollout.clustering.feature_topk=${clustering_feature_topk}"
+    "actor_rollout_ref.rollout.clustering.feature_chunk_size=${clustering_feature_chunk_size}"
+    "actor_rollout_ref.rollout.clustering.gradient_model_path=${clustering_gradient_model_path}"
+  )
 fi
 
 "${cmd[@]}"

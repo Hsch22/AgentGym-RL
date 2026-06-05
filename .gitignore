@@ -5,6 +5,10 @@ models/
 .tmp/
 results/
 wandb/
+logs/
+
+# Generated experiment reports
+docs/
 
 # Python cache/build artifacts
 __pycache__/

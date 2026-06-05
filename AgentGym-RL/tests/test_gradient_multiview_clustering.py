@@ -97,6 +97,28 @@ def test_all_invalid_candidates_fall_back_to_raw_indices():
     assert selected == [0, 1]
 
 
+def test_sciworld_normalized_action_canonicalizes_common_aliases():
+    assert clustering.parse_valid_action(
+        "Thought:\ninspect\n\nAction:\nPick-up \"red apple\".",
+        action_normalizer="sciworld",
+    ) == "pick up red apple"
+    assert clustering.parse_valid_action(
+        "Thought:\ncheck room\n\nAction:\nlookaround",
+        action_normalizer="sciworld",
+    ) == "look around"
+    assert clustering.parse_valid_action(
+        "Thought:\nfree hand\n\nAction:\nput down beaker",
+        action_normalizer="sciworld",
+    ) == "drop beaker"
+    assert clustering.parse_valid_action(
+        "Thought:\nwrong\n\nAction:\nlook around\nThought:\ntry inventory\n\nAction:\ninventory",
+        action_normalizer="sciworld",
+    ) == "inventory"
+    assert clustering.parse_valid_action(
+        "Thought:\nwrong\n\nAction:\nlook around\nThought:\ntry inventory\n\nAction:\ninventory",
+    ) is None
+
+
 def test_tokenizer_without_offsets_uses_stable_prefix_fallback():
     class PrefixTokenizer:
         pad_token_id = 0

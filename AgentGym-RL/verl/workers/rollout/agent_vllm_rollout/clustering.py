@@ -13,12 +13,16 @@ parse_valid_action(text)                          -> Optional[str]
 select_centers_gradient(model, tokenizer, ...)   -> List[int]
 select_centers_semantic(model, tokenizer, ...)   -> List[int]
 select_centers_gradient_multiview(...)           -> List[int]
+select_centers_g2rl_action_gradient(...)         -> List[int]
+select_centers_g2rl_normalized_action_gradient(...) -> List[int]
+select_centers_quality_unique_action(...)        -> List[int]
 select_centers(method, model, tokenizer, ...)    -> List[int]
 """
 
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -40,6 +44,13 @@ _DEFAULT_MULTIVIEW_CHUNK_SIZE = 4
 _MULTIVIEW_TOKEN_BATCH_SIZE = 16
 _MULTIVIEW_EPS = 1e-8
 _TEXTCRAFT_ACTION_RE = re.compile(r"Action:\s*(.*?)(?=\n|$)")
+_ACTION_NORMALIZER_ALIASES = {
+    "": "textcraft",
+    "default": "textcraft",
+    "textcraft": "textcraft",
+    "sciworld": "sciworld",
+    "scienceworld": "sciworld",
+}
 
 
 @dataclass(frozen=True)
@@ -66,6 +77,13 @@ class _MultiviewCandidateFeature:
     thought_feature: torch.Tensor
     thought_residual: torch.Tensor
     mean_logprob: float
+
+
+@dataclass
+class _G2RLCandidateFeature:
+    raw_index: int
+    normalized_action: str
+    feature: torch.Tensor
 
 
 def kcenter_greedy(
@@ -321,20 +339,108 @@ def _normalize_textcraft_action(raw: str) -> Optional[str]:
     return normalized if normalized else None
 
 
-def _parse_textcraft_candidate_with_spans(
-    raw_index: int,
-    text: str,
-) -> Optional[Tuple[TextCraftCandidate, Tuple[int, int], Tuple[int, int]]]:
-    matches = list(_TEXTCRAFT_ACTION_RE.finditer(text))
-    if len(matches) != 1:
+def resolve_action_normalizer(action_normalizer: Optional[str] = None) -> str:
+    normalizer = str(action_normalizer or "textcraft").strip().lower()
+    normalizer = _ACTION_NORMALIZER_ALIASES.get(normalizer, normalizer)
+    if normalizer not in {"textcraft", "sciworld"}:
+        raise ValueError(
+            f"Unsupported action_normalizer={action_normalizer!r}; "
+            "expected 'textcraft' or 'sciworld'"
+        )
+    return normalizer
+
+
+def _normalize_sciworld_action(raw: str) -> Optional[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    text = text.splitlines()[0].strip()
+    if text.endswith("</s>"):
+        text = text[:-4].strip()
+    text = re.sub(r"^[\"'`]+|[\"'`]+$", "", text)
+    text = re.sub(r"[_-]+", " ", text)
+    text = re.sub(r"[^A-Za-z0-9 ]+", " ", text)
+    text = " ".join(text.lower().split()).strip()
+    if not text:
         return None
 
-    match = matches[0]
-    raw_action = match.group(1)
-    normalized = _normalize_textcraft_action(raw_action)
+    text = re.sub(r"^(?:i will|i should|i need to|let me|now i will)\s+", "", text)
+    if text.isdigit():
+        return text
+    choose_match = re.fullmatch(r"choose\s+([0-9]+)", text)
+    if choose_match:
+        return choose_match.group(1)
+    if text in {"wait1", "wait 1", "wait one"}:
+        return "wait1"
+    if text in {"wait", "wait10", "wait 10", "wait ten"}:
+        return "wait"
+
+    aliases = (
+        ("look around", "look around"),
+        ("lookaround", "look around"),
+        ("look at", "look at"),
+        ("lookat", "look at"),
+        ("look in", "look in"),
+        ("lookin", "look in"),
+        ("pick up", "pick up"),
+        ("pickup", "pick up"),
+        ("put down", "drop"),
+        ("putdown", "drop"),
+        ("go to", "go to"),
+        ("goto", "go to"),
+        ("focus on", "focus on"),
+        ("focus", "focus on"),
+        ("deactivate", "deactivate"),
+        ("activate", "activate"),
+        ("disconnect", "disconnect"),
+        ("connect", "connect"),
+        ("inventory", "inventory"),
+        ("examine", "examine"),
+        ("close", "close"),
+        ("open", "open"),
+        ("read", "read"),
+        ("move", "move"),
+        ("drop", "drop"),
+        ("pour", "pour"),
+        ("dunk", "dunk"),
+        ("mix", "mix"),
+        ("use", "use"),
+        ("eat", "eat"),
+        ("flush", "flush"),
+        ("task", "task"),
+    )
+    for alias, canonical in aliases:
+        if text == alias:
+            return canonical
+        if text.startswith(alias + " "):
+            suffix = text[len(alias):].strip()
+            return f"{canonical} {suffix}".strip()
+    return text
+
+
+def _parse_action_candidate_with_spans(
+    raw_index: int,
+    text: str,
+    *,
+    action_normalizer: Optional[str] = None,
+) -> Optional[Tuple[TextCraftCandidate, Tuple[int, int], Tuple[int, int]]]:
+    normalizer = resolve_action_normalizer(action_normalizer)
+    matches = list(_TEXTCRAFT_ACTION_RE.finditer(text))
+    if normalizer == "textcraft":
+        if len(matches) != 1:
+            return None
+        match = matches[0]
+        normalized = _normalize_textcraft_action(match.group(1))
+    else:
+        if not matches:
+            return None
+        match = matches[-1]
+        normalized = _normalize_sciworld_action(match.group(1))
+
     if normalized is None:
         return None
 
+    raw_action = match.group(1)
     thought_span = (0, match.start())
     action_span = match.span(1)
     candidate = TextCraftCandidate(
@@ -347,6 +453,17 @@ def _parse_textcraft_candidate_with_spans(
     return candidate, thought_span, action_span
 
 
+def _parse_textcraft_candidate_with_spans(
+    raw_index: int,
+    text: str,
+) -> Optional[Tuple[TextCraftCandidate, Tuple[int, int], Tuple[int, int]]]:
+    return _parse_action_candidate_with_spans(
+        raw_index,
+        text,
+        action_normalizer="textcraft",
+    )
+
+
 def parse_textcraft_candidate(raw_index: int, text: str) -> Optional[TextCraftCandidate]:
     parsed = _parse_textcraft_candidate_with_spans(raw_index, text)
     if parsed is None:
@@ -355,16 +472,15 @@ def parse_textcraft_candidate(raw_index: int, text: str) -> Optional[TextCraftCa
     return candidate
 
 
-def parse_valid_action(text: str) -> Optional[str]:
+def parse_valid_action(text: str, action_normalizer: Optional[str] = None) -> Optional[str]:
     """Extract the normalized action from a raw LLM response.
 
-    Logic matches ``AgentGym/agentenv/agentenv/envs/textcraft.py`` ``step()``:
-
-    1. Apply ``re.findall(r"Action:\\s*(.*?)(?=\\n|$)", text)``.
-    2. Require exactly **one** match; otherwise return ``None``.
-    3. Normalize: ``re.sub(r"[^A-Za-z0-9, ]+", "", raw)``, then
-       ``" ".join(normalized.split()).strip()``.
-    4. Return ``None`` if the normalized string is empty.
+    ``action_normalizer='textcraft'`` preserves the TextCraft rule used in
+    the original ablation: require exactly one ``Action:`` line and strip
+    punctuation except commas. ``action_normalizer='sciworld'`` uses the last
+    ``Action:`` line, lowercases it, collapses common SciWorld command aliases
+    such as ``pickup``/``pick up`` and ``put down``/``drop``, and keeps the
+    executable action intent as the compact feature text.
 
     Parameters
     ----------
@@ -375,7 +491,14 @@ def parse_valid_action(text: str) -> Optional[str]:
     -------
     Normalized action string, or ``None`` if the response is invalid.
     """
-    candidate = parse_textcraft_candidate(0, text)
+    parsed = _parse_action_candidate_with_spans(
+        0,
+        text,
+        action_normalizer=action_normalizer,
+    )
+    if parsed is None:
+        return None
+    candidate, _, _ = parsed
     return None if candidate is None else candidate.normalized_action
 
 
@@ -1087,6 +1210,569 @@ def _compute_multiview_features(
     return features
 
 
+def _compute_candidate_mean_logprobs(
+    model: torch.nn.Module,
+    tokenizer,
+    obs_token_ids: List[int],
+    parsed_candidates: Sequence[Tuple[TextCraftCandidate, Tuple[int, int], Tuple[int, int]]],
+    *,
+    feature_chunk_size: int,
+    temperature: float,
+    stats: Optional[MutableMapping[str, int]] = None,
+) -> List[Tuple[TextCraftCandidate, float]]:
+    """Score candidate responses by mean token logprob under the current actor."""
+    device = next(model.parameters()).device
+    obs_ids = [int(x) for x in obs_token_ids]
+    if len(obs_ids) < 1:
+        raise ValueError("obs_token_ids must be non-empty for causal token scoring")
+
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    chunk_size = max(1, int(feature_chunk_size))
+
+    token_infos = []
+    fallback_count = 0
+    for candidate, thought_span, action_span in parsed_candidates:
+        response_ids, _, _, used_fallback = _candidate_token_indices(
+            tokenizer,
+            candidate.raw_text,
+            thought_span,
+            action_span,
+        )
+        fallback_count += int(used_fallback)
+        if not response_ids:
+            continue
+        token_infos.append((candidate, thought_span, action_span, response_ids))
+
+    if stats is not None:
+        stats["offset_fallback_count"] = stats.get("offset_fallback_count", 0) + fallback_count
+        stats["quality_unique_scored_candidates"] = (
+            stats.get("quality_unique_scored_candidates", 0) + len(token_infos)
+        )
+
+    scored: List[Tuple[TextCraftCandidate, float]] = []
+    model_was_training = bool(model.training)
+    model.eval()
+
+    try:
+        for start_idx in range(0, len(token_infos), chunk_size):
+            end_idx = min(start_idx + chunk_size, len(token_infos))
+            chunk_infos = token_infos[start_idx:end_idx]
+            full_ids_list = [
+                obs_ids + response_ids
+                for _, _, _, response_ids in chunk_infos
+            ]
+            max_len = max(len(ids) for ids in full_ids_list)
+
+            input_ids = torch.full(
+                (len(chunk_infos), max_len),
+                pad_id,
+                dtype=torch.long,
+                device=device,
+            )
+            attention_mask = torch.zeros(
+                (len(chunk_infos), max_len),
+                dtype=torch.long,
+                device=device,
+            )
+            pad_lengths: List[int] = []
+            for local_i, ids in enumerate(full_ids_list):
+                seq_len = len(ids)
+                pad_len = max_len - seq_len
+                pad_lengths.append(pad_len)
+                input_ids[local_i, pad_len:] = torch.tensor(ids, dtype=torch.long, device=device)
+                attention_mask[local_i, pad_len:] = 1
+
+            position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+
+            try:
+                with torch.no_grad():
+                    outputs = _model_forward_no_grad(
+                        model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        return_dict=True,
+                    )
+                logits = outputs.logits
+            except torch.OutOfMemoryError:
+                del input_ids, attention_mask, position_ids
+                _empty_cuda_cache_for(device)
+                if len(chunk_infos) == 1:
+                    raise
+                local_mid = max(1, len(chunk_infos) // 2)
+                left_candidates = [
+                    (candidate, thought_span, action_span)
+                    for candidate, thought_span, action_span, _ in chunk_infos[:local_mid]
+                ]
+                right_candidates = [
+                    (candidate, thought_span, action_span)
+                    for candidate, thought_span, action_span, _ in chunk_infos[local_mid:]
+                ]
+                left = _compute_candidate_mean_logprobs(
+                    model,
+                    tokenizer,
+                    obs_token_ids,
+                    left_candidates,
+                    feature_chunk_size=1,
+                    temperature=temperature,
+                    stats=None,
+                )
+                right = _compute_candidate_mean_logprobs(
+                    model,
+                    tokenizer,
+                    obs_token_ids,
+                    right_candidates,
+                    feature_chunk_size=1,
+                    temperature=temperature,
+                    stats=None,
+                )
+                scored.extend(left)
+                scored.extend(right)
+                continue
+
+            for local_i, (candidate, _thought_span, _action_span, response_ids) in enumerate(chunk_infos):
+                response_len = len(response_ids)
+                target_ids = torch.tensor(response_ids, dtype=torch.long, device=device)
+                prediction_start = pad_lengths[local_i] + len(obs_ids) - 1
+                prediction_positions = torch.arange(
+                    prediction_start,
+                    prediction_start + response_len,
+                    dtype=torch.long,
+                    device=device,
+                )
+                next_token_logits = logits[local_i].index_select(0, prediction_positions)
+                mean_logprob = _mean_logprob_from_logits(
+                    next_token_logits,
+                    target_ids,
+                    temperature=temperature,
+                )
+                scored.append((candidate, mean_logprob))
+                del target_ids, prediction_positions, next_token_logits
+
+            del outputs, logits, input_ids, attention_mask, position_ids
+            _empty_cuda_cache_for(device)
+    finally:
+        if model_was_training:
+            model.train()
+
+    return scored
+
+
+def _compute_g2rl_text_features(
+    model: torch.nn.Module,
+    tokenizer,
+    obs_token_ids: List[int],
+    candidate_texts: Sequence[Tuple[TextCraftCandidate, str]],
+    *,
+    feature_topk: int,
+    feature_chunk_size: int,
+    temperature: float,
+    stats: Optional[MutableMapping[str, int]] = None,
+    stats_prefix: str = "g2rl",
+) -> List[_G2RLCandidateFeature]:
+    """Compute the G2RL token-gradient feature for compact candidate texts.
+
+    This mirrors ``DataParallelPPOActor._accumulate_g2rl_features``: for each
+    token in the selected feature text, use ``realized lm_head weight -
+    expected lm_head weight`` and average across tokens.
+    """
+    device = next(model.parameters()).device
+    obs_ids = [int(x) for x in obs_token_ids]
+    if len(obs_ids) < 1:
+        raise ValueError("obs_token_ids must be non-empty for causal token scoring")
+
+    lm_head_weight = _get_output_embedding_weight(model)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    chunk_size = max(1, int(feature_chunk_size))
+    feature_topk = max(1, int(feature_topk))
+
+    token_infos = []
+    for candidate, feature_text in candidate_texts:
+        text = str(feature_text or "").strip() or "no action"
+        response_ids = [int(x) for x in tokenizer.encode(text, add_special_tokens=False)]
+        if not response_ids:
+            response_ids = [pad_id]
+        token_infos.append((candidate, response_ids))
+
+    if stats is not None:
+        key = f"{stats_prefix}_feature_candidates"
+        stats[key] = stats.get(key, 0) + len(token_infos)
+
+    features: List[_G2RLCandidateFeature] = []
+    model_was_training = bool(model.training)
+    model.eval()
+
+    try:
+        for start_idx in range(0, len(token_infos), chunk_size):
+            end_idx = min(start_idx + chunk_size, len(token_infos))
+            chunk_infos = token_infos[start_idx:end_idx]
+            full_ids_list = [obs_ids + response_ids for _, response_ids in chunk_infos]
+            max_len = max(len(ids) for ids in full_ids_list)
+
+            input_ids = torch.full(
+                (len(chunk_infos), max_len),
+                pad_id,
+                dtype=torch.long,
+                device=device,
+            )
+            attention_mask = torch.zeros(
+                (len(chunk_infos), max_len),
+                dtype=torch.long,
+                device=device,
+            )
+            pad_lengths: List[int] = []
+            for local_i, ids in enumerate(full_ids_list):
+                seq_len = len(ids)
+                pad_len = max_len - seq_len
+                pad_lengths.append(pad_len)
+                input_ids[local_i, pad_len:] = torch.tensor(ids, dtype=torch.long, device=device)
+                attention_mask[local_i, pad_len:] = 1
+
+            position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+
+            try:
+                with torch.no_grad():
+                    outputs = _model_forward_no_grad(
+                        model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        return_dict=True,
+                    )
+                logits = outputs.logits
+            except torch.OutOfMemoryError:
+                del input_ids, attention_mask, position_ids
+                _empty_cuda_cache_for(device)
+                if len(chunk_infos) == 1:
+                    raise
+                local_mid = max(1, len(chunk_infos) // 2)
+                left = _compute_g2rl_text_features(
+                    model,
+                    tokenizer,
+                    obs_token_ids,
+                    [
+                        (candidate, tokenizer.decode(response_ids, skip_special_tokens=True))
+                        for candidate, response_ids in chunk_infos[:local_mid]
+                    ],
+                    feature_topk=feature_topk,
+                    feature_chunk_size=1,
+                    temperature=temperature,
+                    stats=None,
+                    stats_prefix=stats_prefix,
+                )
+                right = _compute_g2rl_text_features(
+                    model,
+                    tokenizer,
+                    obs_token_ids,
+                    [
+                        (candidate, tokenizer.decode(response_ids, skip_special_tokens=True))
+                        for candidate, response_ids in chunk_infos[local_mid:]
+                    ],
+                    feature_topk=feature_topk,
+                    feature_chunk_size=1,
+                    temperature=temperature,
+                    stats=None,
+                    stats_prefix=stats_prefix,
+                )
+                features.extend(left)
+                features.extend(right)
+                continue
+
+            for local_i, (candidate, response_ids) in enumerate(chunk_infos):
+                response_len = len(response_ids)
+                target_ids = torch.tensor(response_ids, dtype=torch.long, device=device)
+                prediction_start = pad_lengths[local_i] + len(obs_ids) - 1
+                prediction_positions = torch.arange(
+                    prediction_start,
+                    prediction_start + response_len,
+                    dtype=torch.long,
+                    device=device,
+                )
+                next_token_logits = logits[local_i].index_select(0, prediction_positions)
+                feature = _mean_sensitivity_feature(
+                    next_token_logits,
+                    target_ids,
+                    list(range(response_len)),
+                    lm_head_weight,
+                    feature_topk=feature_topk,
+                    temperature=temperature,
+                )
+                features.append(
+                    _G2RLCandidateFeature(
+                        raw_index=candidate.raw_index,
+                        normalized_action=candidate.normalized_action,
+                        feature=feature,
+                    )
+                )
+                del target_ids, prediction_positions, next_token_logits
+
+            del outputs, logits, input_ids, attention_mask, position_ids
+            _empty_cuda_cache_for(device)
+    finally:
+        if model_was_training:
+            model.train()
+
+    return features
+
+
+def _select_g2rl_feature_kcenters(features: Sequence[_G2RLCandidateFeature], k: int) -> List[int]:
+    if not features:
+        return []
+    feature_matrix = torch.stack([feature.feature for feature in features], dim=0).float()
+    normalized = F.normalize(feature_matrix, p=2, dim=-1, eps=1e-12)
+    effective_k = min(int(k), int(normalized.shape[0]))
+    if effective_k <= 0:
+        return []
+    result = kcenter_greedy(normalized, effective_k, initial_center_index=0)
+    return [features[feature_idx].raw_index for feature_idx in result.center_indices]
+
+
+def _select_unique_actions_by_quality(
+    scored_candidates: Sequence[Tuple[TextCraftCandidate, float]],
+    k: int,
+) -> List[int]:
+    effective_k = min(int(k), len(scored_candidates))
+    if effective_k <= 0:
+        return []
+
+    def sort_key(local_idx: int) -> Tuple[float, int]:
+        candidate, score = scored_candidates[local_idx]
+        quality = float(score)
+        if not math.isfinite(quality):
+            quality = float("-inf")
+        return (-quality, candidate.raw_index)
+
+    ordered = sorted(range(len(scored_candidates)), key=sort_key)
+    selected_local: List[int] = []
+    selected_set = set()
+    seen_actions = set()
+
+    for local_idx in ordered:
+        candidate, _score = scored_candidates[local_idx]
+        if candidate.normalized_action in seen_actions:
+            continue
+        selected_local.append(local_idx)
+        selected_set.add(local_idx)
+        seen_actions.add(candidate.normalized_action)
+        if len(selected_local) >= effective_k:
+            return [scored_candidates[i][0].raw_index for i in selected_local]
+
+    for local_idx in ordered:
+        if local_idx in selected_set:
+            continue
+        selected_local.append(local_idx)
+        if len(selected_local) >= effective_k:
+            break
+
+    return [scored_candidates[i][0].raw_index for i in selected_local]
+
+
+def select_centers_quality_unique_action(
+    model: torch.nn.Module,
+    tokenizer,
+    obs_token_ids: List[int],
+    response_texts: List[str],
+    k: int,
+    *,
+    temperature: float = 1.0,
+    feature_chunk_size: int = _DEFAULT_MULTIVIEW_CHUNK_SIZE,
+    stats: Optional[MutableMapping[str, int]] = None,
+) -> List[int]:
+    """Select high-confidence candidates while forcing unique normalized actions first.
+
+    This is a quality-constrained diversity baseline for TextCraft: it keeps the
+    round0 expansion budget but avoids low-logprob tail candidates unless they
+    are needed to fill the requested number of centers.
+    """
+    parsed_candidates: List[Tuple[TextCraftCandidate, Tuple[int, int], Tuple[int, int]]] = []
+    invalid_count = 0
+    for raw_index, text in enumerate(response_texts):
+        parsed = _parse_textcraft_candidate_with_spans(raw_index, text)
+        if parsed is None:
+            invalid_count += 1
+            continue
+        parsed_candidates.append(parsed)
+
+    if stats is not None:
+        stats["quality_unique_invalid_candidates"] = (
+            stats.get("quality_unique_invalid_candidates", 0) + invalid_count
+        )
+
+    if not parsed_candidates:
+        return list(range(min(k, len(response_texts))))
+
+    scored_candidates = _compute_candidate_mean_logprobs(
+        model,
+        tokenizer,
+        obs_token_ids,
+        parsed_candidates,
+        feature_chunk_size=feature_chunk_size,
+        temperature=temperature,
+        stats=stats,
+    )
+    if not scored_candidates:
+        return [
+            candidate.raw_index
+            for candidate, _, _ in parsed_candidates[: min(k, len(parsed_candidates))]
+        ]
+
+    selected = _select_unique_actions_by_quality(scored_candidates, k)
+    if stats is not None:
+        unique_actions = {candidate.normalized_action for candidate, _ in scored_candidates}
+        selected_action_counts = {}
+        for raw_index in selected:
+            candidate = next(
+                (
+                    scored_candidate
+                    for scored_candidate, _score in scored_candidates
+                    if scored_candidate.raw_index == raw_index
+                ),
+                None,
+            )
+            if candidate is None:
+                continue
+            selected_action_counts[candidate.normalized_action] = (
+                selected_action_counts.get(candidate.normalized_action, 0) + 1
+            )
+        duplicate_fill_count = sum(
+            max(0, count - 1)
+            for count in selected_action_counts.values()
+        )
+        stats["quality_unique_action_count"] = (
+            stats.get("quality_unique_action_count", 0) + len(unique_actions)
+        )
+        stats["quality_unique_duplicate_fill_count"] = (
+            stats.get("quality_unique_duplicate_fill_count", 0) + duplicate_fill_count
+        )
+    return selected
+
+
+def select_centers_g2rl_action_gradient(
+    model: torch.nn.Module,
+    tokenizer,
+    obs_token_ids: List[int],
+    response_texts: List[str],
+    k: int,
+    *,
+    temperature: float = 1.0,
+    feature_topk: int = _DEFAULT_MULTIVIEW_TOPK,
+    feature_chunk_size: int = _DEFAULT_MULTIVIEW_CHUNK_SIZE,
+    stats: Optional[MutableMapping[str, int]] = None,
+) -> List[int]:
+    """Select candidates by k-center over the same action-gradient feature used by G2RL.
+
+    The per-candidate embedding is the token-averaged ``realized lm_head weight
+    - expected lm_head weight`` feature for the parsed Action span. This matches
+    the runtime G2RL feature formula for action-scope tokens; the selector uses
+    it only as a rollout-time clustering criterion and does not change rewards.
+    """
+    parsed_candidates: List[Tuple[TextCraftCandidate, Tuple[int, int], Tuple[int, int]]] = []
+    invalid_count = 0
+    for raw_index, text in enumerate(response_texts):
+        parsed = _parse_textcraft_candidate_with_spans(raw_index, text)
+        if parsed is None:
+            invalid_count += 1
+            continue
+        parsed_candidates.append(parsed)
+
+    if stats is not None:
+        stats["g2rl_action_invalid_candidates"] = (
+            stats.get("g2rl_action_invalid_candidates", 0) + invalid_count
+        )
+
+    if not parsed_candidates:
+        return list(range(min(k, len(response_texts))))
+
+    features = _compute_multiview_features(
+        model,
+        tokenizer,
+        obs_token_ids,
+        parsed_candidates,
+        feature_topk=feature_topk,
+        feature_chunk_size=feature_chunk_size,
+        temperature=temperature,
+        stats=stats,
+    )
+    if not features:
+        return [
+            candidate.raw_index
+            for candidate, _, _ in parsed_candidates[: min(k, len(parsed_candidates))]
+        ]
+
+    if stats is not None:
+        stats["g2rl_action_feature_candidates"] = (
+            stats.get("g2rl_action_feature_candidates", 0) + len(features)
+        )
+
+    feature_matrix = torch.stack([feature.action_feature for feature in features], dim=0).float()
+    normalized = F.normalize(feature_matrix, p=2, dim=-1, eps=1e-12)
+    effective_k = min(int(k), int(normalized.shape[0]))
+    if effective_k <= 0:
+        return []
+
+    result = kcenter_greedy(normalized, effective_k, initial_center_index=0)
+    return [features[feature_idx].raw_index for feature_idx in result.center_indices]
+
+
+def select_centers_g2rl_normalized_action_gradient(
+    model: torch.nn.Module,
+    tokenizer,
+    obs_token_ids: List[int],
+    response_texts: List[str],
+    k: int,
+    *,
+    temperature: float = 1.0,
+    feature_topk: int = _DEFAULT_MULTIVIEW_TOPK,
+    feature_chunk_size: int = _DEFAULT_MULTIVIEW_CHUNK_SIZE,
+    stats: Optional[MutableMapping[str, int]] = None,
+    action_normalizer: Optional[str] = None,
+) -> List[int]:
+    """Select candidates by k-center over G2RL normalized-action features.
+
+    This matches the main TextCraft G2RL feature scope used in the training
+    experiments: tokenize the parser-normalized action text as the compact
+    response, compute the G2RL token-gradient feature, and cluster those
+    features at rollout time without enabling reward shaping.
+    """
+    parsed_candidates: List[TextCraftCandidate] = []
+    invalid_count = 0
+    for raw_index, text in enumerate(response_texts):
+        parsed = _parse_action_candidate_with_spans(
+            raw_index,
+            text,
+            action_normalizer=action_normalizer,
+        )
+        if parsed is None:
+            invalid_count += 1
+            continue
+        candidate, _, _ = parsed
+        parsed_candidates.append(candidate)
+
+    if stats is not None:
+        stats["g2rl_normalized_action_invalid_candidates"] = (
+            stats.get("g2rl_normalized_action_invalid_candidates", 0) + invalid_count
+        )
+
+    if not parsed_candidates:
+        return list(range(min(k, len(response_texts))))
+
+    features = _compute_g2rl_text_features(
+        model,
+        tokenizer,
+        obs_token_ids,
+        [(candidate, candidate.normalized_action) for candidate in parsed_candidates],
+        feature_topk=feature_topk,
+        feature_chunk_size=feature_chunk_size,
+        temperature=temperature,
+        stats=stats,
+        stats_prefix="g2rl_normalized_action",
+    )
+    if not features:
+        return [candidate.raw_index for candidate in parsed_candidates[: min(k, len(parsed_candidates))]]
+
+    return _select_g2rl_feature_kcenters(features, k)
+
+
 def select_centers_gradient_multiview(
     model: torch.nn.Module,
     tokenizer,
@@ -1152,13 +1838,16 @@ def select_centers(
     feature_topk: int = _DEFAULT_MULTIVIEW_TOPK,
     feature_chunk_size: int = _DEFAULT_MULTIVIEW_CHUNK_SIZE,
     stats: Optional[MutableMapping[str, int]] = None,
+    action_normalizer: Optional[str] = None,
 ) -> List[int]:
     """Dispatcher: select cluster centers by *method*.
 
     Parameters
     ----------
     method:
-        ``"gradient"`` or ``"semantic"``.
+        ``"gradient"``, ``"gradient_multiview"``, ``"g2rl_action_gradient"``,
+        ``"g2rl_normalized_action_gradient"``, ``"quality_unique_action"``, or
+        ``"semantic"``.
     model:
         HF CausalLM actor module.
     tokenizer:
@@ -1195,6 +1884,42 @@ def select_centers(
             max_rounds=max_rounds,
             temperature=temperature,
             feature_topk=feature_topk,
+            feature_chunk_size=feature_chunk_size,
+            stats=stats,
+        )
+    if method == "g2rl_action_gradient":
+        return select_centers_g2rl_action_gradient(
+            model,
+            tokenizer,
+            obs_token_ids,
+            response_texts,
+            k,
+            temperature=temperature,
+            feature_topk=feature_topk,
+            feature_chunk_size=feature_chunk_size,
+            stats=stats,
+        )
+    if method == "g2rl_normalized_action_gradient":
+        return select_centers_g2rl_normalized_action_gradient(
+            model,
+            tokenizer,
+            obs_token_ids,
+            response_texts,
+            k,
+            temperature=temperature,
+            feature_topk=feature_topk,
+            feature_chunk_size=feature_chunk_size,
+            stats=stats,
+            action_normalizer=action_normalizer,
+        )
+    if method == "quality_unique_action":
+        return select_centers_quality_unique_action(
+            model,
+            tokenizer,
+            obs_token_ids,
+            response_texts,
+            k,
+            temperature=temperature,
             feature_chunk_size=feature_chunk_size,
             stats=stats,
         )

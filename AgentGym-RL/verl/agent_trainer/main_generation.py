@@ -96,6 +96,7 @@ def main(config):
         dp_size = wg.world_size // config.rollout.tensor_model_parallel_size
         num_batch = (total_samples // config_batch_size) + 1
         output_lst = [[] for _ in range(config.data.n_samples)]
+        success_lst = [[] for _ in range(config.data.n_samples)]
         env_client = init_env_client(config.agentgym)
 
         for batch_idx in range(num_batch):
@@ -148,29 +149,41 @@ def main(config):
                 output = output[:real_batch_size]
 
                 output_lst[i].extend(output.batch['task_scores'].sum(dim=-1).tolist())
+                if 'task_successes' in output.batch.keys():
+                    success_lst[i].extend(output.batch['task_successes'].float().tolist())
+                else:
+                    # Backward compatibility for old rollout outputs.
+                    success_lst[i].extend((output.batch['task_scores'].sum(dim=-1) > 0).float().tolist())
 
         # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
         output_np = np.array(output_lst, dtype=object)
         output_np = np.transpose(output_np, axes=(1, 0))
         output_lst = output_np.tolist()
+        success_np = np.array(success_lst, dtype=object)
+        success_np = np.transpose(success_np, axes=(1, 0))
+        success_lst = success_np.tolist()
 
         print("============Total Task Evaluation============")
         print(f"Avg@{config.data.n_samples}: {np.mean(output_np)}")
-        print(f"Pass@{config.data.n_samples}: {np.mean(np.max(output_np, axis=-1) > 0)}")
+        print(f"Pass@{config.data.n_samples}: {np.mean(np.max(success_np, axis=-1) > 0)}")
+        print(f"ScorePositive@{config.data.n_samples}: {np.mean(np.max(output_np, axis=-1) > 0)}")
         if category_files:
             print("============Sub Task Evaluation============")
             category_success_bucket = defaultdict(list)
-            for item_id, score in zip(item_ids, output_lst):
+            category_pass_bucket = defaultdict(list)
+            for item_id, score, success in zip(item_ids, output_lst, success_lst):
                 category = category_map.get(item_id)
                 if category is not None:
                     category_success_bucket[category].append(score)
+                    category_pass_bucket[category].append(success)
             for category_file in category_files:
                 category = category_file.split(".")[0]
                 if not category_success_bucket.get(category):
                     continue
                 print(f"Category: {category}")
                 print(f"Avg@{config.data.n_samples}: {np.mean(np.array(category_success_bucket[category]))}")
-                print(f"Pass@{config.data.n_samples}: {np.mean(np.max(np.array(category_success_bucket[category]), axis=-1) > 0)}")
+                print(f"Pass@{config.data.n_samples}: {np.mean(np.max(np.array(category_pass_bucket[category]), axis=-1) > 0)}")
+                print(f"ScorePositive@{config.data.n_samples}: {np.mean(np.max(np.array(category_success_bucket[category]), axis=-1) > 0)}")
     finally:
         if env_client is not None:
             try:

@@ -72,6 +72,7 @@ actor_rollout_ref:
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1
+    seed: 0
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
@@ -100,19 +101,20 @@ actor_rollout_ref:
     rollout_log_dir: null # Directory for storing rollout trajectories.
     clustering:
       enabled: false                  # Toggle clustering-based action selection
-      method: gradient                # "gradient", "gradient_multiview", "semantic", "random_valid", or "random_raw"
-      round1_candidates: 64           # Candidates generated in round 0
+      method: gradient                # "gradient", "gradient_multiview", "g2rl_action_gradient", "g2rl_normalized_action_gradient", "quality_unique_action", "semantic", "random_valid", or "random_raw"
+      round1_candidates: 16           # Candidates generated in round 0; default is 2x rollout.n=8
       round1_clusters: 8              # Cluster centers kept as parallel trajectories
-      later_candidates: 16            # Candidates generated per trajectory in later rounds
-      later_clusters: 4               # Clusters per trajectory in later rounds
-      later_cluster_every: 1          # Cluster every N later rounds; 0 disables later-round clustering
+      later_candidates: 4             # Candidates generated per trajectory if later-round clustering is enabled
+      later_clusters: 1               # Clusters per trajectory in later rounds
+      later_cluster_every: 0          # Cluster every N later rounds; 0 disables later-round clustering
       later_cluster_start: 1          # First later round index eligible for clustering
       later_cluster_until: -1         # Last eligible later round index; -1 means no explicit cap
       later_cluster_horizon_min: 0.0  # Skip clustering when remaining-horizon ratio is below this value
       gradient_d_proj: 512            # CountSketch projection dim for gradient clustering
-      feature_topk: 256               # Top-k softmax approximation for gradient_multiview features
-      feature_chunk_size: 4           # HF forward chunk size for gradient_multiview features
+      feature_topk: 256               # Top-k softmax approximation for G2RL/gradient_multiview features
+      feature_chunk_size: 4           # HF forward chunk size for G2RL/gradient_multiview/quality_unique_action scoring
       gradient_model_path: /mnt/workspace/users/mws/husicheng/code/AgentGym-RL/models/Qwen2.5-3B-Instruct  # Standalone HF model for gradient/semantic clustering
+      action_normalizer: textcraft    # Parser/normalizer for normalized-action clustering: textcraft or sciworld
   mclaw:
     tree_rollout:
       root_budget: 256       # Number of candidate actions sampled at root
@@ -213,11 +215,15 @@ algorithm:
     steps_scaling_inter: 100  # Frequency (in training steps) to increase the maximum number of turns when using `scaling_inter_stepwise`.
   g2rl:
     enabled: false             # Paper-style trajectory-level G2RL reward shaping before advantage computation
-    feature_scope: response    # response keeps legacy trajectory-level features; action keeps only TextCraft Action contents
+    stop_after_steps: null     # null or <=0 keeps G2RL active for the whole run; positive values stop after that global step
+    feature_scope: response    # response keeps legacy trajectory-level features; action keeps raw Action contents; normalized_action uses parser-normalized TextCraft action sequences
     lambda_coef: 1.0           # Multiplicative novelty strength: shaped_signed = signed_reward * (1 + lambda * novelty)
     reward_clip: 3.0           # Clip shaped signed reward to [-reward_clip, reward_clip]
     zero_one_to_signed: true   # Map 0/1 task success to -1/+1 before shaping
     normalize_novelty: true    # Min-max normalize novelty within each prompt group
+    novelty_dtype: float64     # Precision for driver-side novelty/cosine computation: float32 or float64
+    skip_all_failed_groups: false  # When true, leave all-failed prompt groups on original signed rewards
+    success_only_novelty: false    # When true, compute/apply novelty only on successful trajectories
     feature_topk: 256          # Top-k softmax approximation for E_p[W]
     token_chunk_size: 256      # Token chunk size for feature accumulation inside actor forward
     eps: 1e-6
@@ -238,6 +244,7 @@ trainer:
   # disable: start from scratch; auto: use default_local_dir/latest_checkpointed_iteration.txt;
   # /path/to/global_step_N: explicitly resume that checkpoint.
   resume_mode: auto
+  resume_allow_extend_total_training_steps: false  # Allow continuing a strict checkpoint with a larger total_training_steps.
   resume_from_path: False
   test_freq: -1
   test_batches: 1

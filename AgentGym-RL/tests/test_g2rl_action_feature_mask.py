@@ -5,6 +5,7 @@ from verl.workers.agent_fsdp_workers import (
     build_textcraft_action_feature_mask,
     build_textcraft_action_feature_mask_fast,
     build_textcraft_action_feature_mask_slow,
+    build_textcraft_normalized_action_feature_inputs,
     find_textcraft_action_spans,
 )
 
@@ -121,3 +122,28 @@ def test_fast_action_feature_mask_uses_slow_fallback_for_no_marker_and_unsupport
     ]
     for text in texts:
         assert _fast_selection_for_text(tokenizer, text) is None
+
+
+def test_normalized_action_feature_inputs_replace_response_tokens():
+    tokenizer = CharTokenizer()
+    prompts, prompt_attention_mask = _batch_texts(tokenizer, ['Goal: one', 'Goal: two'])
+    prompt_position_ids = torch.arange(prompts.size(1), dtype=torch.long).unsqueeze(0).repeat(2, 1)
+
+    feature_inputs = build_textcraft_normalized_action_feature_inputs(
+        normalized_action_texts=['get 1 oak log\ncraft 4 oak planks', ''],
+        prompts=prompts,
+        prompt_attention_mask=prompt_attention_mask.to(dtype=torch.long),
+        prompt_position_ids=prompt_position_ids,
+        tokenizer=tokenizer,
+    )
+
+    selected_texts = _selected_texts(
+        tokenizer,
+        feature_inputs['responses'],
+        feature_inputs['response_mask'],
+    )
+
+    assert selected_texts == ['get 1 oak log\ncraft 4 oak planks', 'no action']
+    assert feature_inputs['input_ids'].shape[0] == 2
+    assert feature_inputs['input_ids'].shape[1] == prompts.size(1) + feature_inputs['responses'].size(1)
+    assert torch.equal(feature_inputs['attention_mask'][:, :prompts.size(1)], prompt_attention_mask.to(dtype=torch.long))

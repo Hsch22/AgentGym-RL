@@ -73,6 +73,7 @@ _TEXTCRAFT_UNSUPPORTED_MARKERS = (
 _TEXTCRAFT_MARKER_CACHE = {}
 _TEXTCRAFT_UNSUPPORTED_MARKER_CACHE = {}
 _TEXTCRAFT_TOKEN_KIND_CACHE = {}
+G2RL_NORMALIZED_ACTION_TEXTS_KEY = "g2rl_normalized_action_texts"
 
 
 def find_textcraft_action_spans(text: str) -> List[Tuple[int, int]]:
@@ -371,6 +372,88 @@ def build_textcraft_action_feature_mask(responses: torch.Tensor,
                                         tokenizer) -> torch.Tensor:
     """Build a response-shaped mask that keeps only TextCraft Action contents."""
     return build_textcraft_action_feature_mask_fast(responses, response_mask, tokenizer)
+
+
+def _tokenizer_pad_id(tokenizer) -> int:
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(tokenizer, "eos_token_id", None)
+    return int(pad_token_id) if pad_token_id is not None else 0
+
+
+def _normalize_action_feature_text(text) -> str:
+    text = str(text or "").strip()
+    return text if text else "no action"
+
+
+def build_textcraft_normalized_action_feature_inputs(
+    *,
+    normalized_action_texts,
+    prompts: torch.Tensor,
+    prompt_attention_mask: torch.Tensor,
+    prompt_position_ids: torch.Tensor,
+    tokenizer,
+):
+    """Create a compact response batch whose tokens are normalized TextCraft actions.
+
+    The resulting tensors have the same keys consumed by ``compute_g2rl_features``.
+    They are used only to compute G2RL features; PPO log-probs and actor updates
+    still use the original sampled responses.
+    """
+    batch_size = int(prompts.size(0))
+    if len(normalized_action_texts) != batch_size:
+        raise ValueError(
+            f"Expected {batch_size} normalized action strings, got {len(normalized_action_texts)}"
+        )
+
+    encoded_rows = []
+    for text in normalized_action_texts:
+        token_ids = list(_encode_token_ids(tokenizer, _normalize_action_feature_text(text)))
+        if not token_ids:
+            token_ids = list(_encode_token_ids(tokenizer, "no action"))
+        if not token_ids:
+            token_ids = [_tokenizer_pad_id(tokenizer)]
+        encoded_rows.append(token_ids)
+
+    response_length = max(1, max(len(row) for row in encoded_rows))
+    device = prompts.device
+    response_ids = torch.full(
+        (batch_size, response_length),
+        _tokenizer_pad_id(tokenizer),
+        dtype=prompts.dtype,
+        device=device,
+    )
+    response_attention_mask = torch.zeros(
+        (batch_size, response_length),
+        dtype=prompt_attention_mask.dtype,
+        device=device,
+    )
+    response_mask = torch.zeros(
+        (batch_size, response_length),
+        dtype=torch.bool,
+        device=device,
+    )
+    for row_idx, token_ids in enumerate(encoded_rows):
+        row_len = len(token_ids)
+        response_ids[row_idx, :row_len] = torch.tensor(token_ids, dtype=prompts.dtype, device=device)
+        response_attention_mask[row_idx, :row_len] = 1
+        response_mask[row_idx, :row_len] = True
+
+    delta_position_ids = torch.arange(
+        1,
+        response_length + 1,
+        dtype=prompt_position_ids.dtype,
+        device=device,
+    ).unsqueeze(0)
+    response_position_ids = prompt_position_ids[:, -1:] + delta_position_ids
+
+    return {
+        "responses": response_ids,
+        "response_mask": response_mask,
+        "input_ids": torch.cat((prompts, response_ids), dim=-1),
+        "attention_mask": torch.cat((prompt_attention_mask, response_attention_mask), dim=-1),
+        "position_ids": torch.cat((prompt_position_ids, response_position_ids), dim=-1),
+    }
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -905,8 +988,28 @@ class ActorRolloutRefWorker(Worker):
                 response_mask=data.batch['response_mask'],
                 tokenizer=self.tokenizer,
             )
+        elif feature_scope in ('normalized_action', 'normalized_actions', 'action_normalized'):
+            feature_scope = 'normalized_action'
+            if G2RL_NORMALIZED_ACTION_TEXTS_KEY not in data.non_tensor_batch:
+                raise ValueError(
+                    f"g2rl feature_scope='normalized_action' requires non_tensor_batch "
+                    f"{G2RL_NORMALIZED_ACTION_TEXTS_KEY!r}"
+                )
+            prompt_length = data.batch['prompts'].size(-1)
+            normalized_inputs = build_textcraft_normalized_action_feature_inputs(
+                normalized_action_texts=data.non_tensor_batch[G2RL_NORMALIZED_ACTION_TEXTS_KEY],
+                prompts=data.batch['prompts'],
+                prompt_attention_mask=data.batch['attention_mask'][:, :prompt_length],
+                prompt_position_ids=data.batch['position_ids'][:, :prompt_length],
+                tokenizer=self.tokenizer,
+            )
+            for key, value in normalized_inputs.items():
+                data.batch[key] = value
         else:
-            raise ValueError(f"Unsupported g2rl_feature_scope={feature_scope!r}; expected 'response' or 'action'")
+            raise ValueError(
+                f"Unsupported g2rl_feature_scope={feature_scope!r}; "
+                f"expected 'response', 'action', or 'normalized_action'"
+            )
 
         data = data.to('cuda')
         data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size_per_gpu
